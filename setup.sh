@@ -11,8 +11,6 @@ fi
 
 install_packages
 
-install_nerd_fonts
-
 dotsetup ./home
 
 activate_ssh_agent

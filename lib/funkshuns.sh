@@ -68,6 +68,7 @@ install_packages() {
     ;;
   GNU/Linux)
     install_packages_apt
+    install_nerd_fonts
     install_packages_x
     return $?
     ;;
