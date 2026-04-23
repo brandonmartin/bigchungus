@@ -1,0 +1,20 @@
+[Unit]
+Description=Headless Xorg + i3 Session
+After=network.target
+Wants=network.target
+
+[Service]
+User=b
+Group=b
+WorkingDirectory=/home/b
+Environment=DISPLAY=:1
+Environment=XAUTHORITY=/home/b/.Xauthority
+Environment=HOME=/home/b
+
+ExecStart=/usr/bin/startx /home/b/.xsession -- :1 vt1 -quiet
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+#!/bin/bash
+
+if pgrep -f "clip-sync" | grep -v $$ > /dev/null; then
+    exit 0
+fi
+
+while true; do
+    CLIP=$(xclip -o -selection clipboard 2>/dev/null || true)
+
+    if [[ -n "$CLIP" ]]; then
+        # Remove \r + squeeze multiple newlines into single newlines
+        CLEAN=$(echo -n "$CLIP" | tr -d '\r' | tr -s '\n' '\n')
+        echo -n "$CLEAN" | xclip -i -selection clipboard
+        echo -n "$CLEAN" | xclip -i -selection primary
+    fi
+    sleep 0.3
+done

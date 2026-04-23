@@ -1,0 +1,17 @@
+#!/bin/bash
+# Restore wallpaper from base64
+
+BASE64_FILE="$HOME/.config/wallpaper.base64"
+WALLPAPER="$HOME/.cache/wallpaper.jpg"
+
+if [[ ! -f "$BASE64_FILE" ]]; then
+    echo "Error: wallpaper.base64 not found"
+    exit 1
+fi
+
+# Decode base64 back to jpg
+base64 -d "$BASE64_FILE" > "$WALLPAPER"
+
+# Set wallpaper stretched to screen
+feh --bg-fill "$WALLPAPER"
+

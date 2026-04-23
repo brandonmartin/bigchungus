@@ -1,0 +1,64 @@
+# =============================================
+# Working Two-Line Starship Prompt
+# =============================================
+
+format = """
+$username$hostname$directory$git_branch$git_status
+$python$nodejs$rust$golang$mise$cmd_duration$character"""
+
+# First Line
+[username]
+style_user = "bold green"
+style_root = "bold red"
+format = "[$user]($style) "
+
+[hostname]
+ssh_only = false
+format = "🌍 [$hostname](bold blue) "
+
+[directory]
+truncation_length = 4
+truncate_to_repo = true
+style = "bold cyan"
+format = "in [$path]($style) "
+
+[git_branch]
+format = "on [$branch](bold purple) "
+
+[git_status]
+format = "([$all_status$ahead_behind]($style) )"
+style = "bold yellow"
+
+# Second Line
+[python]
+format = "[$symbol($version)]($style) "
+style = "bold yellow"
+symbol = "🐍 "
+
+[nodejs]
+format = "[$symbol($version)]($style) "
+style = "bold green"
+symbol = " "
+
+[rust]
+format = "[$symbol($version)]($style) "
+style = "bold red"
+symbol = " "
+
+[golang]
+format = "[$symbol($version)]($style) "
+style = "bold cyan"
+symbol = " "
+
+[mise]
+format = "[$symbol($version)]($style) "
+style = "bold blue"
+symbol = "⚡ "
+
+[cmd_duration]
+min_time = 2000
+format = "took [$duration](bold yellow) "
+
+[character]
+success_symbol = "[❯](bold green)"
+error_symbol = "[❯](bold red)"

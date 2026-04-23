@@ -1,0 +1,50 @@
+[Unit]
+Description=Xpra :999 Desktop Session
+After=network.target
+Wants=network.target
+
+[Service]
+#User=b
+#Group=b
+WorkingDirectory=/home/b
+Environment=DISPLAY=:999
+#Environment=XDEFAULTRESOLUTION=1920x1080
+#Environment=XDEFAULTRESOLUTION=2650x1080
+#Environment=XDEFAULTRESOLUTION=2560x1440
+#Environment=XDEFAULTRESOLUTION=3440x1440
+#Environment=XDEFAULTRESOLUTION=5120x1440
+Environment=XDEFAULTRESOLUTION=4320x1800
+#Environment=XDEFAULTRESOLUTION=3240x2160
+#Environment=XDEFAULTRESOLUTION=7680x2160
+Environment=XDEFAULTBITDEPTH=24
+Environment=XAUTHORITY=/home/b/.Xauthority
+Environment=HOME=/home/b
+
+ExecStart=/usr/bin/xpra start-desktop ${DISPLAY} \
+  --start-child=/home/b/.xsession \
+  --exit-with-children \
+  --no-daemon \
+  --xvfb="Xvfb +extension Composite +extension RANDR +extension RENDER +extension GLX -screen 0 ${XDEFAULTRESOLUTION}x${XDEFAULTBITDEPTH} -nolisten tcp -nolisten local -noreset" \
+  --encoding=h264 \
+  --video-encoders=h264 \
+  --compress=1 \
+  --speed=80 \
+  --min-speed=50 \
+  --quality=80 \
+  --min-quality=60 \
+  --opengl=no \
+  --speaker=no \
+  --microphone=no \
+  --webcam=no \
+  --clipboard=yes \
+  --clipboard-direction=both \
+  --mmap=yes \
+  --resize-display=${XDEFAULTRESOLUTION}
+
+#ExecStart=/usr/bin/xpra start-desktop ${DISPLAY} --no-daemon --start-child=/home/b/.xsession --exit-with-children --xvfb="Xvfb +extension Composite -screen 0 ${XDEFAULTRESOLUTION} -nolisten tcp -nolisten local -noreset"
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

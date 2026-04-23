@@ -1,0 +1,98 @@
+# i3 config 
+
+#set $mod Mod4
+set $mod Mod1
+
+# =================================================================
+# Font
+# =================================================================
+font pango:DejaVu Sans Mono:pixelsize=10
+
+# =================================================================
+# Appearance
+# =================================================================
+for_window [class=".*"] border pixel 2
+
+gaps inner 0
+gaps outer 0
+
+client.focused          #285577 #285577 #ffffff #285577 #4c7899
+client.focused_inactive #333333 #333333 #ffffff #484e50 #5f676a
+client.unfocused        #333333 #333333 #888888 #292d2e #222222
+client.urgent           #900000 #900000 #ffffff #900000 #900000
+
+# =================================================================
+# Workspaces
+# =================================================================
+set $ws1 "1: main"
+set $ws2 "2: code"
+set $ws3 "3: gassy"
+set $ws4 "4: farts"
+set $ws5 "5: sharts"
+set $ws6 "6: beer"
+set $ws7 "7: misc"
+set $ws8 "8: junk"
+set $ws9 "9: internets"
+
+bindsym $mod+1 workspace $ws1
+bindsym $mod+2 workspace $ws2
+bindsym $mod+3 workspace $ws3
+bindsym $mod+4 workspace $ws4
+bindsym $mod+5 workspace $ws5
+bindsym $mod+6 workspace $ws6
+bindsym $mod+7 workspace $ws7
+bindsym $mod+8 workspace $ws8
+bindsym $mod+9 workspace $ws9
+
+bindsym $mod+Shift+1 move container to workspace $ws1
+bindsym $mod+Shift+2 move container to workspace $ws2
+bindsym $mod+Shift+3 move container to workspace $ws3
+bindsym $mod+Shift+4 move container to workspace $ws4
+bindsym $mod+Shift+5 move container to workspace $ws5
+bindsym $mod+Shift+6 move container to workspace $ws6
+bindsym $mod+Shift+7 move container to workspace $ws7
+bindsym $mod+Shift+8 move container to workspace $ws8
+bindsym $mod+Shift+9 move container to workspace $ws9
+
+# =================================================================
+# Keybindings
+# =================================================================
+bindsym $mod+Return exec wezterm
+bindsym $mod+Shift+q kill
+bindsym $mod+Shift+r restart
+
+# Navigation (Vim style)
+bindsym $mod+h focus left
+bindsym $mod+j focus down
+bindsym $mod+k focus up
+bindsym $mod+l focus right
+
+bindsym $mod+Shift+h move left
+bindsym $mod+Shift+j move down
+bindsym $mod+Shift+k move up
+bindsym $mod+Shift+l move right
+
+bindsym $mod+v split vertical
+bindsym $mod+b split horizontal
+
+bindsym $mod+f fullscreen toggle
+bindsym $mod+Shift+space floating toggle
+
+# =================================================================
+# Status bar
+# =================================================================
+bar {
+    position top
+    status_command i3status
+    font pango:DejaVu Sans Mono 9
+}
+
+# =================================================================
+# Startup applications
+# =================================================================
+exec --no-startup-id ~/.local/bin/set-wallpaper
+exec --no-startup-id picom &
+# exec --no-startup-id ~/.local/bin/clip-sync &
+
+# Floating rules
+for_window [window_role="popup"] floating enable

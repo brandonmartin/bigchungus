@@ -1,0 +1,8 @@
+! Molokai Theme for xterm/urxvt fallback
+xterm*background: #101010
+xterm*foreground: #d0d0d0
+xterm*faceName: JetBrainsMono Nerd Font:pixelsize=10
+
+URxvt*background: #101010
+URxvt*foreground: #d0d0d0
+URxvt*faceName: JetBrainsMono Nerd Font:pixelsize=10
