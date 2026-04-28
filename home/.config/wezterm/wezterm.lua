@@ -11,6 +11,7 @@ config.window_padding = {
   top = 0,
   bottom = 0,
 }
+config.mux_enable_ssh_agent = false
 config.colors = {
   foreground = "#c0caf5",
   background = "#1a1b26",

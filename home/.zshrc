@@ -7,6 +7,10 @@ setup_path
 
 load_antidote
 
+#unalias gc 2> /dev/null
+
 init_starship
 
+eval "$(mise activate zsh)"
 
+activate_ssh_agent
