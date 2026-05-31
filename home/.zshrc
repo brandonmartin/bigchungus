@@ -14,3 +14,9 @@ init_starship
 eval "$(mise activate zsh)"
 
 activate_ssh_agent
+
+# >>> grok installer >>>
+export PATH="$HOME/.grok/bin:$PATH"
+fpath=(~/.grok/completions/zsh $fpath)
+autoload -Uz compinit && compinit -C
+# <<< grok installer <<<
