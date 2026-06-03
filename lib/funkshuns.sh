@@ -33,14 +33,14 @@ dotsetup() {
 }
 
 install_packages_apt() {
-  sudo apt-update -y && sudo apt install curl -y
+  sudo apt update -y && sudo apt install curl -y
   sudo install -dm 755 /etc/apt/keyrings
   sudo add-apt-repository ppa:neovim-ppa/unstable -y
   curl -fSs https://mise.jdx.dev/gpg-key.pub | sudo tee /etc/apt/keyrings/mise-archive-keyring.asc 1>/dev/null
   echo "deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.asc] https://mise.jdx.dev/deb stable main" | sudo tee /etc/apt/sources.list.d/mise.list
 
   sudo apt update -y
-  sudo apt install mise unzip tmux stow git curl neovim ripgrep fd-find build-essential -y
+  sudo apt install mise unzip tmux fontconfig stow git curl neovim ripgrep fd-find build-essential -y
 }
 
 install_packages_brew() {
@@ -51,7 +51,7 @@ install_packages_brew() {
 
 install_packages_x() {
   curl -fSsL https://xpra.org/xpra.asc | sudo tee /etc/apt/keyrings/xpra.asc 1>/dev/null
-  echo "deb [signed-by=/etc/apt/keyrings/xpra.asc] https://xpra.org/ noble main" | sudo tee /etc/apt/sources.list.d/xpra.list
+  echo "deb [signed-by=/etc/apt/keyrings/xpra.asc] https://xpra.org/ resolute main" | sudo tee /etc/apt/sources.list.d/xpra.list
   curl -fsSL https://apt.fury.io/wez/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/wezterm-fury.gpg
   echo "deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *" | sudo tee /etc/apt/sources.list.d/wezterm.list
   sudo curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
