@@ -1,0 +1,25 @@
+# Installed automatically by `claude-lb-refresh` on first refresh/read/install.
+# The live unit is written to:
+#   ${XDG_CONFIG_HOME:-~/.config}/systemd/user/claude-lb-refresh.service
+# with an absolute ExecStart path for the host that ran install.
+#
+# Manual bootstrap on a new machine:
+#   claude-lb-refresh install
+# or simply:
+#   claude-lb-refresh refresh
+
+[Unit]
+Description=Claude profile usage cache refresher (OAuth API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-lb-refresh daemon
+Restart=always
+RestartSec=5s
+Environment=CLAUDE_LB_REFRESH_INTERVAL=30
+Environment=CLAUDE_LB_CACHE_TTL=30
+
+[Install]
+WantedBy=default.target
