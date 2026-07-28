@@ -10,6 +10,7 @@ if ! check_zsh; then
 fi
 
 install_packages
+install_homebrew_linux
 
 dotsetup ./home
 

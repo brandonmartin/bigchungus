@@ -1,4 +1,5 @@
 export LOCAL_BIN_DIR="${HOME}/.local/bin"
+export LOCAL_WBIN_DIR="${HOME}/.local/wbin"
 export SSH_ENV="$HOME/.ssh-agent-env"
 
 log() {
@@ -13,7 +14,7 @@ check_zsh() {
 }
 
 setup_path() {
-  export PATH="${LOCAL_BIN_DIR}:${PATH}"
+  export PATH="${LOCAL_WBIN_DIR}:${LOCAL_BIN_DIR}:${PATH}"
   return
 }
 
@@ -47,6 +48,11 @@ install_packages_brew() {
   brew install mise stow git curl tmux neovim ripgrep fd unzip 
   return
 
+}
+
+install_homebrew_linux() {
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  #echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> ~/.zshrc
 }
 
 install_packages_x() {
@@ -145,7 +151,11 @@ install_nerd_font() {
 }
 
 start_ssh_agent() {
-  ssh-agent -s | sed 's/^echo/#echo/' >"${SSH_ENV}"
+  # Bind the agent to a fixed socket path so non-interactive processes
+  # (daemons, cron, agent tool shells) can reach it via ssh_config
+  # IdentityAgent without any environment plumbing.
+  rm -f "$HOME/.ssh/agent.sock"
+  ssh-agent -a "$HOME/.ssh/agent.sock" -s | sed 's/^echo/#echo/' >"${SSH_ENV}"
   chmod 600 "${SSH_ENV}"
   source "${SSH_ENV}" >/dev/null
   ssh-add -l >/dev/null 2>&1 || ssh-add
