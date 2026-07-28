@@ -1,0 +1,846 @@
+#!/usr/bin/env bash
+# gc-balance — safe ad-hoc Claude profile balancing for a running Gas City.
+#
+# Default is dry-run: reports skew and proposed actions only.
+# Use --apply to execute safe actions (unpin + suspend idle pool/refinery
+# agents on the overweight profile). Never touches mayor/deacon/witness/boot
+# unless --allow-infrastructure is set.
+#
+# Profile selection matches claude-wrapper.sh:
+#   pool agents → usage-aware LB; infrastructure → hash pin;
+#   ~/.claude-profiles/agent-overrides → manual migrate target.
+
+set -euo pipefail
+
+# ====================== CONFIG ======================
+PROFILES_DIR="${CLAUDE_PROFILES_DIR:-$HOME/.claude-profiles}"
+LB_BASE_DIR="$PROFILES_DIR"
+LB_CACHE_FILE="$PROFILES_DIR/.lb-cache"
+LB_LOCK_FILE="$PROFILES_DIR/.lb-cache.lock"
+OVERRIDES_FILE="$PROFILES_DIR/agent-overrides"
+LB_CACHE_TTL="${CLAUDE_LB_CACHE_TTL:-30}"
+LB_FORCE_GAP="${CLAUDE_LB_FORCE_GAP:-2}"
+LB_USAGE_WEIGHT="${CLAUDE_LB_USAGE_WEIGHT:-10}"
+LB_PROC_WEIGHT="${CLAUDE_LB_PROC_WEIGHT:-6}"
+LB_POOL_PROC_WEIGHT="${CLAUDE_LB_POOL_PROC_WEIGHT:-0}"
+LB_BIAS_THRESHOLD="${CLAUDE_LB_BIAS_THRESHOLD:-2}"
+LB_BIAS_MULTIPLIER="${CLAUDE_LB_BIAS_MULTIPLIER:-5}"
+
+USAGE_THRESHOLD="${GC_BALANCE_USAGE_THRESHOLD:-5}"   # % weekly gap before acting
+PROC_THRESHOLD="${GC_BALANCE_PROC_THRESHOLD:-1}"     # worker count gap before acting
+IDLE_MINUTES="${GC_BALANCE_IDLE_MINUTES:-15}"        # last_active age for "idle"
+
+CITY=""
+APPLY=0
+WAKE=0
+ALLOW_INFRA=0
+REFRESH_USAGE=0
+JSON_OUT=0
+VERBOSE=0
+MIGRATE_AGENT=""
+MIGRATE_TO=""
+CLEAR_MIGRATE=""
+FORCE_POOL=""
+CLEAR_FORCE_POOL=0
+CORRECTION_PROFILE=""
+CORRECTION_VALUE=""
+CLEAR_CORRECTIONS=0
+# ===================================================
+
+_GC_BALANCE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=claude-lb-usage.sh
+source "$_GC_BALANCE_DIR/claude-lb-usage.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: gc-balance [options]
+
+Analyze Claude profile skew for a running Gas City and propose (or apply)
+safe rebalancing actions. Dry-run by default.
+
+Options:
+  --city PATH              City directory (default: walk up from $PWD)
+  --apply                  Execute safe actions (unpin + suspend idle pool/refinery)
+  --wake                   With --apply, also wake asleep agents on light profile
+  --allow-infrastructure   Allow actions on mayor/deacon/witness/boot (dangerous)
+  --refresh-usage          Refresh weekly /stats cache before analyzing
+  --threshold N            Weekly usage gap % to trigger actions (default: 5)
+  --idle-minutes N         Minutes since last_active to count as idle (default: 15)
+  --json                   Machine-readable JSON report on stdout
+  --verbose                Extra detail
+  --migrate AGENT          Force-move an agent to a profile (resets session)
+  --to A|B                 Target profile for --migrate (required with --migrate)
+  --clear-migrate AGENT    Remove a manual override; agent reverts to hash/LB
+  --force-pool A|B         Force all pool spawns to profile A or B (until cleared)
+  --clear-force-pool       Clear pool spawn force; revert to usage-aware LB
+  --correction A|B N       Add N% to profile usage for LB skew (effective = raw + N)
+  --clear-corrections      Clear all usage corrections
+  -h, --help               Show this help
+
+Safe action tiers (without --allow-infrastructure):
+  • suspend idle pool agents (dog, polecat, polekitten)
+  • suspend idle refinery sessions (unpins first if pinned)
+  • suggest waking asleep refinery/witness on the light profile (needs --wake)
+
+Pool agents (dogs, polecats, polekittens) use usage-aware LB on each spawn.
+Named infrastructure stays hash-pinned unless --migrate sets an override.
+EOF
+}
+
+log() { printf '%s\n' "$*" >&2; }
+vlog() { if (( VERBOSE )); then log "$@"; fi; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --city) shift; CITY="${1:?--city requires path}"; shift ;;
+        --apply) APPLY=1; shift ;;
+        --wake) WAKE=1; shift ;;
+        --allow-infrastructure) ALLOW_INFRA=1; shift ;;
+        --refresh-usage) REFRESH_USAGE=1; shift ;;
+        --threshold) shift; USAGE_THRESHOLD="${1:?}"; shift ;;
+        --idle-minutes) shift; IDLE_MINUTES="${1:?}"; shift ;;
+        --json) JSON_OUT=1; shift ;;
+        --verbose) VERBOSE=1; shift ;;
+        --migrate) shift; MIGRATE_AGENT="${1:?--migrate requires agent}"; shift ;;
+        --to) shift; MIGRATE_TO="${1:?--to requires A or B}"; shift ;;
+        --clear-migrate) shift; CLEAR_MIGRATE="${1:?--clear-migrate requires agent}"; shift ;;
+        --force-pool) shift; FORCE_POOL="${1:?--force-pool requires A or B}"; shift ;;
+        --clear-force-pool) CLEAR_FORCE_POOL=1; shift ;;
+        --correction) shift; CORRECTION_PROFILE="${1:?--correction requires A or B}"; shift; CORRECTION_VALUE="${1:?--correction requires N}"; shift ;;
+        --clear-corrections) CLEAR_CORRECTIONS=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) log "Unknown option: $1"; usage; exit 2 ;;
+    esac
+done
+
+if [[ -n "$MIGRATE_AGENT" && -z "$MIGRATE_TO" ]]; then
+    log "❌ --migrate requires --to A or --to B"
+    exit 2
+fi
+if [[ -n "$MIGRATE_TO" && "$MIGRATE_TO" != "A" && "$MIGRATE_TO" != "B" ]]; then
+    log "❌ --to must be A or B"
+    exit 2
+fi
+if [[ -n "$FORCE_POOL" && "$FORCE_POOL" != "A" && "$FORCE_POOL" != "B" ]]; then
+    log "❌ --force-pool must be A or B"
+    exit 2
+fi
+if [[ -n "$CORRECTION_PROFILE" && "$CORRECTION_PROFILE" != "A" && "$CORRECTION_PROFILE" != "B" ]]; then
+    log "❌ --correction profile must be A or B"
+    exit 2
+fi
+if [[ -n "$CORRECTION_VALUE" && ! "$CORRECTION_VALUE" =~ ^-?[0-9]+$ ]]; then
+    log "❌ --correction value must be an integer percent"
+    exit 2
+fi
+
+handle_force_pool() {
+    local target=$1
+    if (( APPLY )); then
+        lb_set_pool_force "$target"
+        log "✅ Pool spawns forced → $target (clear with: gc-balance --clear-force-pool --apply)"
+    else
+        log "[DRY-RUN] would force all pool spawns → $target"
+    fi
+    log ""
+}
+
+handle_clear_force_pool() {
+    local current
+    current=$(lb_read_pool_force 2>/dev/null || true)
+    if [[ -z "$current" ]]; then
+        log "ℹ️  No pool spawn force active"
+        return 0
+    fi
+    if (( APPLY )); then
+        lb_clear_pool_force
+        log "✅ Cleared pool spawn force (was → $current); pool agents revert to usage-aware LB"
+    else
+        log "[DRY-RUN] would clear pool spawn force (currently → $current)"
+    fi
+    log ""
+}
+
+handle_usage_correction() {
+    local profile=$1 val=$2
+    local corr_a corr_b
+    read -r corr_a corr_b < <(lb_read_usage_corrections_from_file)
+    case "$profile" in
+        A) corr_a=$val ;;
+        B) corr_b=$val ;;
+    esac
+    if (( APPLY )); then
+        lb_set_usage_correction "$profile" "$val"
+        log "✅ Usage correction: A=${corr_a}% B=${corr_b}% (effective = raw + correction)"
+        log "   clear with: gc-balance --clear-corrections --apply"
+    else
+        log "[DRY-RUN] would set usage correction: A=${corr_a}% B=${corr_b}%"
+    fi
+    log ""
+}
+
+handle_clear_corrections() {
+    local corr_a corr_b
+    read -r corr_a corr_b < <(lb_read_usage_corrections) || true
+    if (( corr_a == 0 && corr_b == 0 )) && [[ ! -f "$LB_USAGE_CORRECTION_FILE" ]]; then
+        log "ℹ️  No usage corrections active"
+        return 0
+    fi
+    if (( APPLY )); then
+        lb_clear_usage_corrections
+        log "✅ Cleared usage corrections (was A=${corr_a}% B=${corr_b}%)"
+    else
+        log "[DRY-RUN] would clear usage corrections (currently A=${corr_a}% B=${corr_b}%)"
+    fi
+    log ""
+}
+
+hash_profile_for_agent() {
+    local agent=$1 hash
+    hash=$(printf '%s' "$agent" | cksum | cut -d' ' -f1)
+    if [ $((hash % 2)) -eq 0 ]; then printf 'A'; else printf 'B'; fi
+}
+
+read_agent_override() {
+    local agent=$1
+    [[ -f "$OVERRIDES_FILE" ]] || return 1
+    grep -E "^${agent}=[AB]$" "$OVERRIDES_FILE" 2>/dev/null | tail -1 | cut -d= -f2
+}
+
+set_agent_override() {
+    local agent=$1 profile=$2 tmp
+    mkdir -p "$PROFILES_DIR"
+    touch "$OVERRIDES_FILE"
+    tmp="${OVERRIDES_FILE}.tmp.$$"
+    grep -v "^${agent}=" "$OVERRIDES_FILE" > "$tmp" 2>/dev/null || true
+    echo "${agent}=${profile}" >> "$tmp"
+    mv -f "$tmp" "$OVERRIDES_FILE"
+    chmod 600 "$OVERRIDES_FILE"
+}
+
+clear_agent_override() {
+    local agent=$1 tmp
+    [[ -f "$OVERRIDES_FILE" ]] || return 0
+    tmp="${OVERRIDES_FILE}.tmp.$$"
+    grep -v "^${agent}=" "$OVERRIDES_FILE" > "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$OVERRIDES_FILE"
+}
+
+resolve_agent_name() {
+    local query=$1
+    python3 - "$query" <<'PY'
+import json, os, sys
+query = sys.argv[1]
+data = json.loads(os.environ["SESSIONS_JSON"])
+for s in data.get("sessions", []):
+    candidates = {
+        s.get("id"), s.get("alias"), s.get("agent_name"), s.get("name"),
+        s.get("template"), s.get("title"),
+    }
+    candidates = {c for c in candidates if c}
+    if query in candidates:
+        print(s.get("agent_name") or s.get("name") or s.get("alias"))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+handle_migrate() {
+    local agent_query=$1 target=$2
+    local agent hash_prof current state
+
+    agent=$(resolve_agent_name "$agent_query") || {
+        log "❌ Could not resolve agent: $agent_query"
+        exit 1
+    }
+    hash_prof=$(hash_profile_for_agent "$agent")
+    current=$(read_agent_override "$agent" 2>/dev/null || true)
+    state=$(python3 - "$agent" <<'PY'
+import json, os, sys
+agent = sys.argv[1]
+for s in json.loads(os.environ["SESSIONS_JSON"]).get("sessions", []):
+    if (s.get("agent_name") or s.get("name")) == agent:
+        print(s.get("state", "?"))
+        break
+PY
+)
+
+    log "🔀 Migrate: $agent"
+    log "   hash default: $hash_prof"
+    [[ -n "$current" ]] && log "   current override: $current"
+    log "   target override: $target"
+    log "   session state: $state"
+    if (( APPLY )); then
+        set_agent_override "$agent" "$target"
+        log "→ gc session reset $agent_query"
+        gc --city "$CITY" session reset "$agent_query"
+        log "✅ Override set; session reset requested (next spawn uses profile $target)"
+    else
+        log "   [DRY-RUN] would: set override $agent=$target + gc session reset $agent_query"
+    fi
+    log ""
+}
+
+handle_clear_migrate() {
+    local agent_query=$1 agent
+    agent=$(resolve_agent_name "$agent_query") || {
+        log "❌ Could not resolve agent: $agent_query"
+        exit 1
+    }
+    if [[ -z "$(read_agent_override "$agent" 2>/dev/null || true)" ]]; then
+        log "ℹ️  No override for $agent"
+        return 0
+    fi
+    if (( APPLY )); then
+        clear_agent_override "$agent"
+        log "✅ Cleared override for $agent (reverts to hash/LB on next spawn)"
+    else
+        log "[DRY-RUN] would clear override for $agent"
+    fi
+    log ""
+}
+
+# Walk up from $PWD looking for city.toml — same discovery as gc.
+resolve_city_from_pwd() {
+    local dir
+    dir=$(pwd -P)
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/city.toml" ]]; then
+            printf '%s' "$dir"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+resolve_city() {
+    if [[ -n "$CITY" ]]; then
+        printf '%s' "$CITY"
+        return 0
+    fi
+    resolve_city_from_pwd
+}
+
+load_usage() {
+    local real="" usage_a usage_b
+    if (( REFRESH_USAGE )); then
+        real=$(lb_find_real_claude)
+        [[ -n "$real" && -x "$real" ]] || { log "❌ Cannot refresh usage: claude binary not found"; exit 1; }
+        lb_refresh_usage_cache "$real" 1 || log "⚠️  Usage refresh failed; using cache"
+    fi
+    usage_a=$(lb_read_usage_cache A 2>/dev/null || echo "?")
+    usage_b=$(lb_read_usage_cache B 2>/dev/null || echo "?")
+    printf '%s %s\n' "$usage_a" "$usage_b"
+}
+
+count_workers() {
+    python3 - "$PROFILES_DIR" <<'PY'
+import os, sys, subprocess
+base = sys.argv[1]
+counts = {"A": 0, "B": 0, "unknown": 0}
+details = []
+uid = os.getuid()
+try:
+    pids = subprocess.check_output(["pgrep", "-u", str(uid), "-x", "claude"], text=True).split()
+except subprocess.CalledProcessError:
+    pids = []
+for pid in pids:
+    path = f"/proc/{pid}/environ"
+    if not os.access(path, os.R_OK):
+        continue
+    with open(path, "rb") as f:
+        env = f.read().split(b"\0")
+    kv = {}
+    for item in env:
+        if b"=" in item:
+            k, v = item.split(b"=", 1)
+            kv[k.decode()] = v.decode()
+    cdir = kv.get("CLAUDE_CONFIG_DIR", "")
+    agent = kv.get("GC_AGENT", "?")
+    if cdir.endswith("/A"):
+        counts["A"] += 1
+        details.append((agent, "A", pid))
+    elif cdir.endswith("/B"):
+        counts["B"] += 1
+        details.append((agent, "B", pid))
+    else:
+        counts["unknown"] += 1
+print(counts["A"], counts["B"], counts["unknown"])
+for agent, prof, pid in sorted(details):
+    print(f"DETAIL\t{agent}\t{prof}\t{pid}")
+PY
+}
+
+CITY=$(resolve_city) || {
+    log "❌ not in a city directory (no city.toml found)"
+    log "   Run from inside a city tree, or pass --city PATH"
+    exit 1
+}
+[[ -d "$CITY" ]] || { log "❌ City not found: $CITY"; exit 1; }
+
+command -v gc >/dev/null || { log "❌ gc not in PATH"; exit 1; }
+command -v python3 >/dev/null || { log "❌ python3 required"; exit 1; }
+
+read -r USAGE_A USAGE_B < <(load_usage) || true
+LB_CACHE_AGE=$(lb_cache_age 2>/dev/null || echo "?")
+LB_CACHE_SOURCE=$(lb_read_meta refresh_source 2>/dev/null || echo "?")
+read -r WORKERS_A WORKERS_B WORKERS_UNK < <(count_workers | head -1) || true
+WORKER_DETAILS=$(count_workers | grep '^DETAIL' || true)
+
+SESSIONS_JSON=$(gc --city "$CITY" session list --json --state all 2>/dev/null) || {
+    log "❌ gc session list failed for $CITY"
+    exit 1
+}
+SESSIONS_TEXT=$(gc --city "$CITY" session list --state all 2>/dev/null) || true
+
+if [[ -n "$CLEAR_MIGRATE" ]]; then
+    export SESSIONS_JSON
+    handle_clear_migrate "$CLEAR_MIGRATE"
+fi
+if [[ -n "$MIGRATE_AGENT" ]]; then
+    export SESSIONS_JSON
+    handle_migrate "$MIGRATE_AGENT" "$MIGRATE_TO"
+fi
+if [[ -n "$FORCE_POOL" ]]; then
+    handle_force_pool "$FORCE_POOL"
+fi
+if (( CLEAR_FORCE_POOL )); then
+    handle_clear_force_pool
+fi
+if [[ -n "$CORRECTION_PROFILE" ]]; then
+    handle_usage_correction "$CORRECTION_PROFILE" "$CORRECTION_VALUE"
+fi
+if (( CLEAR_CORRECTIONS )); then
+    handle_clear_corrections
+fi
+
+LB_POOL_FORCE=$(lb_read_pool_force 2>/dev/null || true)
+read -r LB_CORRECTION_A LB_CORRECTION_B < <(lb_read_usage_corrections) || true
+LB_CORRECTION_A=${LB_CORRECTION_A:-0}
+LB_CORRECTION_B=${LB_CORRECTION_B:-0}
+
+AGENT_OVERRIDES=""
+[[ -f "$OVERRIDES_FILE" ]] && AGENT_OVERRIDES=$(grep -E '^[^#]+=[AB]$' "$OVERRIDES_FILE" 2>/dev/null || true)
+
+export CITY USAGE_A USAGE_B WORKERS_A WORKERS_B WORKERS_UNK AGENT_OVERRIDES LB_CACHE_AGE LB_CACHE_SOURCE
+export USAGE_THRESHOLD PROC_THRESHOLD IDLE_MINUTES ALLOW_INFRA WAKE APPLY VERBOSE JSON_OUT
+export LB_FORCE_GAP LB_USAGE_WEIGHT LB_PROC_WEIGHT LB_POOL_PROC_WEIGHT LB_BIAS_THRESHOLD LB_BIAS_MULTIPLIER LB_CACHE_TTL LB_POOL_FORCE LB_CORRECTION_A LB_CORRECTION_B
+export SESSIONS_JSON SESSIONS_TEXT WORKER_DETAILS
+
+status_file="${TMPDIR:-/tmp}/gc-balance-status.$$"
+export GC_BALANCE_STATUS="$status_file"
+
+python3 <<'PY'
+import json, os, re, sys
+from datetime import datetime, timezone
+
+def load_overrides() -> dict:
+    raw = os.environ.get("AGENT_OVERRIDES", "")
+    out = {}
+    for line in raw.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            if v in ("A", "B"):
+                out[k] = v
+    return out
+
+OVERRIDES = load_overrides()
+
+def is_pool_agent(agent: str) -> bool:
+    if not agent:
+        return False
+    if agent in {"gastown.mayor", "gastown.deacon", "gastown.boot"}:
+        return False
+    if "gastown.witness" in agent or "gastown.refinery" in agent:
+        return False
+    if "control-dispatcher" in agent:
+        return False
+    if "dog" in agent:
+        return True
+    for token in ("polecat", "polekitten", "thundercat", "gorkcat"):
+        if token in agent:
+            return True
+    if "/koolkats." in agent or agent.startswith("koolkats."):
+        return True
+    if "/gastown." in agent or agent.startswith("gastown.polecat"):
+        return True
+    return False
+
+def hash_profile(agent: str) -> str:
+    import subprocess
+    h = int(subprocess.check_output(["cksum"], input=agent.encode()).decode().split()[0])
+    return "A" if h % 2 == 0 else "B"
+
+pool_force = os.environ.get("LB_POOL_FORCE", "")
+try:
+    corr_a = int(os.environ.get("LB_CORRECTION_A", "0"))
+    corr_b = int(os.environ.get("LB_CORRECTION_B", "0"))
+except ValueError:
+    corr_a = corr_b = 0
+
+def profile_selection(agent: str) -> tuple[str, str]:
+    if agent in OVERRIDES:
+        return OVERRIDES[agent], "override"
+    if is_pool_agent(agent):
+        if pool_force in ("A", "B"):
+            return pool_force, "pool-force"
+        return "LB", "pool-lb"
+    return hash_profile(agent), "hash"
+
+def parse_reasons(text: str) -> dict:
+    reasons = {}
+    for line in text.splitlines()[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r"\s{2,}", line)
+        if len(parts) < 4:
+            continue
+        sid, template, state, reason = parts[0], parts[1], parts[2], parts[3]
+        reasons[sid] = {
+            "template": template,
+            "state": state,
+            "reason": reason,
+            "target": parts[4] if len(parts) > 4 else "",
+        }
+    return reasons
+
+def parse_ts(ts: str):
+    if not ts or ts.startswith("0001-"):
+        return None
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+def classify(agent: str) -> str:
+    if agent in {"gastown.mayor", "gastown.deacon", "gastown.boot"}:
+        return "infrastructure"
+    if "gastown.witness" in agent:
+        return "witness"
+    if "gastown.refinery" in agent:
+        return "refinery"
+    if is_pool_agent(agent):
+        return "pool"
+    return "other"
+
+def idle_minutes(last_active, now, threshold):
+    ts = parse_ts(last_active)
+    if ts is None:
+        return None
+    return (now - ts).total_seconds() / 60.0
+
+city = os.environ["CITY"]
+usage_a = os.environ.get("USAGE_A", "?")
+usage_b = os.environ.get("USAGE_B", "?")
+try:
+    ua = int(usage_a)
+    ub = int(usage_b)
+except ValueError:
+    ua = ub = None
+
+eff_ua = eff_ub = None
+raw_usage_gap = None
+if ua is not None and ub is not None:
+    eff_ua = ua + corr_a
+    eff_ub = ub + corr_b
+    raw_usage_gap = ua - ub
+
+wa = int(os.environ["WORKERS_A"])
+wb = int(os.environ["WORKERS_B"])
+wu = int(os.environ["WORKERS_UNK"])
+
+usage_threshold = float(os.environ["USAGE_THRESHOLD"])
+proc_threshold = int(os.environ["PROC_THRESHOLD"])
+idle_threshold = float(os.environ["IDLE_MINUTES"])
+allow_infra = os.environ.get("ALLOW_INFRA") == "1"
+wake = os.environ.get("WAKE") == "1"
+apply = os.environ.get("APPLY") == "1"
+verbose = os.environ.get("VERBOSE") == "1"
+
+sessions = json.loads(os.environ["SESSIONS_JSON"])["sessions"]
+reasons = parse_reasons(os.environ.get("SESSIONS_TEXT", ""))
+now = datetime.now(timezone.utc)
+
+worker_details = []
+for line in os.environ.get("WORKER_DETAILS", "").splitlines():
+    if line.startswith("DETAIL\t"):
+        _, agent, prof, pid = line.split("\t", 3)
+        worker_details.append({"agent": agent, "profile": prof, "pid": pid})
+
+# Determine skew (effective usage includes corrections)
+heavy = light = None
+usage_gap = proc_gap = 0
+if eff_ua is not None and eff_ub is not None:
+    usage_gap = eff_ua - eff_ub
+if usage_gap >= usage_threshold and (wa - wb) >= proc_threshold:
+    heavy, light = "A", "B"
+elif usage_gap <= -usage_threshold and (wb - wa) >= proc_threshold:
+    heavy, light = "B", "A"
+elif usage_gap >= usage_threshold:
+    heavy, light = "A", "B"  # usage-only skew for suggestions
+elif usage_gap <= -usage_threshold:
+    heavy, light = "B", "A"
+
+actions = []
+notes = []
+report_sessions = []
+
+for s in sessions:
+    agent = s.get("agent_name") or s.get("name") or ""
+    prof, select_mode = profile_selection(agent)
+    tier = classify(agent)
+    rid = s["id"]
+    state = s.get("state", "?")
+    reason_info = reasons.get(rid, {})
+    reason = reason_info.get("reason", "")
+    pinned = "pin" in reason
+    idle_m = idle_minutes(s.get("last_active", ""), now, idle_threshold)
+    is_idle = state == "active" and idle_m is not None and idle_m >= idle_threshold
+
+    entry = {
+        "id": rid,
+        "agent": agent,
+        "template": s.get("template", ""),
+        "state": state,
+        "profile": prof,
+        "select_mode": select_mode,
+        "tier": tier,
+        "reason": reason,
+        "pinned": pinned,
+        "idle_minutes": round(idle_m, 1) if idle_m is not None else None,
+        "last_active": s.get("last_active", ""),
+    }
+    report_sessions.append(entry)
+
+    if heavy is None:
+        continue
+
+    live_prof = None
+    for d in worker_details:
+        if d["agent"] == agent:
+            live_prof = d["profile"]
+            break
+    effective_prof = live_prof or (prof if prof in ("A", "B") else None)
+    if effective_prof is None:
+        continue
+
+    on_heavy = effective_prof == heavy
+    on_light = effective_prof == light
+
+    if on_heavy and state == "active":
+        if tier == "infrastructure" or tier == "witness":
+            notes.append({
+                "type": "protected",
+                "id": rid, "agent": agent, "profile": prof,
+                "detail": f"{tier} on heavy profile — respawn stays on {prof}; skip",
+            })
+        elif tier in {"pool", "refinery"} and is_idle:
+            if tier == "infrastructure" and not allow_infra:
+                continue
+            act = {
+                "type": "suspend",
+                "id": rid, "agent": agent, "profile": prof, "tier": tier,
+                "idle_minutes": entry["idle_minutes"],
+                "pinned": pinned,
+                "safe": tier in {"pool", "refinery"},
+                "detail": f"idle {tier} on heavy profile {prof}",
+            }
+            if pinned:
+                act["pre"] = "unpin"
+            actions.append(act)
+        elif tier in {"pool", "refinery"} and not is_idle:
+            notes.append({
+                "type": "busy",
+                "id": rid, "agent": agent, "profile": prof,
+                "detail": f"active {tier} — not idle (last {entry['idle_minutes']}m ago)",
+            })
+
+    if on_light and state == "asleep" and tier in {"refinery", "witness"}:
+        notes.append({
+            "type": "wake_candidate",
+            "id": rid, "agent": agent, "profile": prof, "tier": tier,
+            "detail": f"asleep {tier} on light profile — wake would add {prof} capacity",
+            "apply_with": "--wake",
+        })
+        if wake and apply:
+            actions.append({
+                "type": "wake",
+                "id": rid, "agent": agent, "profile": prof, "tier": tier,
+                "safe": True,
+                "detail": f"wake asleep {tier} on light profile",
+            })
+
+report = {
+    "city": city,
+    "usage": {
+        "A": usage_a, "B": usage_b,
+        "correction": {"A": corr_a, "B": corr_b},
+        "effective": {"A": eff_ua, "B": eff_ub},
+        "gap_raw": raw_usage_gap,
+        "gap": usage_gap if eff_ua is not None else None,
+    },
+    "workers": {"A": wa, "B": wb, "unknown": wu, "gap": wa - wb},
+    "skew": {"heavy": heavy, "light": light, "balanced": heavy is None},
+    "worker_details": worker_details,
+    "sessions": report_sessions,
+    "actions": actions,
+    "notes": notes,
+    "dry_run": not apply,
+}
+
+# Human output
+if os.environ.get("JSON_OUT") == "1":
+    print(json.dumps(report, indent=2))
+    sys.exit(0)
+
+print(f"🏙️  gc-balance — {city}")
+if OVERRIDES:
+    print("Overrides:", ", ".join(f"{k}→{v}" for k, v in sorted(OVERRIDES.items())))
+if pool_force in ("A", "B"):
+    print(f"Pool force: all pool spawns → {pool_force} (gc-balance --clear-force-pool --apply to revert)")
+if corr_a or corr_b:
+    print(f"Usage correction: A{corr_a:+d}% B{corr_b:+d}% (effective = raw + correction)")
+print()
+cache_age = os.environ.get("LB_CACHE_AGE", "?")
+cache_src = os.environ.get("LB_CACHE_SOURCE", "?")
+cache_ttl = os.environ.get("LB_CACHE_TTL", "30")
+print("Weekly usage (all models):")
+if ua is not None:
+    if corr_a or corr_b:
+        print(
+            f"  A: {usage_a}% ({corr_a:+d}% corr → {eff_ua}% eff)    "
+            f"B: {usage_b}% ({corr_b:+d}% corr → {eff_ub}% eff)"
+        )
+        print(f"  gap: {usage_gap:+d}% effective" + (f"  (raw {raw_usage_gap:+d}%)" if raw_usage_gap is not None else ""))
+    else:
+        print(f"  A: {usage_a}%    B: {usage_b}%    gap: {usage_gap:+d}%")
+    print(f"  cache: age={cache_age}s ttl={cache_ttl}s source={cache_src} (claude-lb-refresh daemon keeps this warm)")
+else:
+    print("  (cache unavailable — run: claude-lb-refresh refresh)")
+print(f"Live claude workers:  A={wa}  B={wb}" + (f"  unknown={wu}" if wu else ""))
+
+if verbose and eff_ua is not None and eff_ub is not None:
+    gap = eff_ua - eff_ub
+    force_gap = float(os.environ.get("LB_FORCE_GAP", "2"))
+    uw = int(os.environ.get("LB_USAGE_WEIGHT", "10"))
+    pw = int(os.environ.get("LB_POOL_PROC_WEIGHT", "0"))
+    bt = int(os.environ.get("LB_BIAS_THRESHOLD", "2"))
+    bm = int(os.environ.get("LB_BIAS_MULTIPLIER", "5"))
+    if pool_force in ("A", "B"):
+        print(f"Pool LB (current): manual force → all pool spawns → {pool_force}")
+    elif abs(gap) >= force_gap:
+        pool_pick = "B" if gap > 0 else "A"
+        corr_s = ""
+        if corr_a or corr_b:
+            corr_s = f" (eff, raw {raw_usage_gap:+d}%)" if raw_usage_gap is not None else " (effective)"
+        print(f"Pool LB (current): gap {gap:+d}%{corr_s} ≥ {force_gap:.0f}% → next pool spawn → {pool_pick} (forced)")
+    else:
+        sa = eff_ua * uw + wa * pw
+        sb = eff_ub * uw + wb * pw
+        if gap >= bt:
+            sa += gap * bm
+        elif gap <= -bt:
+            sb += (-gap) * bm
+        wa_w = max(1, 1000 - sa)
+        wb_w = max(1, 1000 - sb)
+        total = wa_w + wb_w
+        corr_s = ""
+        if corr_a or corr_b:
+            corr_s = f" eff (raw {raw_usage_gap:+d}%)" if raw_usage_gap is not None else " eff"
+        print(
+            f"Pool LB (current): gap {gap:+d}%{corr_s} < {force_gap:.0f}% → "
+            f"P(A)={wa_w/total:.0%} P(B)={wb_w/total:.0%} (weighted)"
+        )
+
+    # Pre-fix weighted-random behaviour (proc weight included) for comparison.
+    pw_old = int(os.environ.get("LB_PROC_WEIGHT", "6"))
+    sa_old = eff_ua * uw + wa * pw_old
+    sb_old = eff_ub * uw + wb * pw_old
+    if gap >= bt:
+        sa_old += gap * bm
+    elif gap <= -bt:
+        sb_old += (-gap) * bm
+    wa_old = max(1, 1000 - sa_old)
+    wb_old = max(1, 1000 - sb_old)
+    total_old = wa_old + wb_old
+    print(
+        f"Pool LB (legacy):  gap {gap:+d}% → P(A)={wa_old/total_old:.0%} P(B)={wb_old/total_old:.0%} "
+        f"(old weighted+proc model)"
+    )
+
+if worker_details:
+    for d in worker_details:
+        print(f"  • {d['agent']} → {d['profile']} (pid {d['pid']})")
+print()
+
+if heavy is None:
+    print("✅ Within thresholds — no rebalance recommended.")
+else:
+    print(f"⚖️  Skew detected — heavy={heavy}, light={light}")
+    print(f"   (usage gap ≥ {usage_threshold:.0f}% and/or worker imbalance)")
+print()
+
+print("Sessions:")
+for e in sorted(report_sessions, key=lambda x: (x["profile"], x["tier"], x["agent"])):
+    idle_s = f" idle={e['idle_minutes']}m" if e["idle_minutes"] is not None else ""
+    pin_s = " pinned" if e["pinned"] else ""
+    mode = e["select_mode"]
+    if e["profile"] == "LB":
+        prof = "pool-LB"
+    elif e["select_mode"] == "pool-force":
+        prof = f"pool→{e['profile']}"
+    else:
+        prof = e["profile"]
+    print(f"  [{prof}/{mode}] {e['state']:7} {e['tier']:14} {e['agent']}{idle_s}{pin_s}")
+
+safe_actions = [a for a in actions if a.get("safe")]
+if notes:
+    print()
+    print("Notes:")
+    for n in notes:
+        tag = n["type"]
+        print(f"  ({tag}) {n['agent']}: {n['detail']}")
+
+if safe_actions:
+    print()
+    print("Proposed actions:" + (" [DRY-RUN]" if not apply else " [APPLYING]"))
+    for a in safe_actions:
+        pre = f"{a['pre']} → " if a.get("pre") else ""
+        print(f"  • {pre}{a['type']} {a['id']} ({a['agent']}) — {a['detail']}")
+else:
+    if heavy is not None:
+        print()
+        print("No safe automatic actions right now.")
+
+if apply and safe_actions:
+    import subprocess
+    gc = ["gc", "--city", city]
+    for a in safe_actions:
+        sid = a["id"]
+        if a.get("pre") == "unpin":
+            print(f"→ gc session unpin {sid}", file=sys.stderr)
+            subprocess.run(gc + ["session", "unpin", sid], check=True)
+        print(f"→ gc session {a['type']} {sid}", file=sys.stderr)
+        subprocess.run(gc + ["session", a["type"], sid], check=True)
+    open(os.environ["GC_BALANCE_STATUS"], "w").write(str(len(safe_actions)))
+elif apply:
+    open(os.environ["GC_BALANCE_STATUS"], "w").write("0")
+else:
+    open(os.environ["GC_BALANCE_STATUS"], "w").write("dry-run")
+PY
+
+if (( ! JSON_OUT )); then
+    if (( APPLY )); then
+        n=$(cat "$status_file" 2>/dev/null || echo 0)
+        if [[ "$n" != "dry-run" && "$n" -gt 0 ]]; then
+            log ""
+            log "✅ Applied $n action(s)."
+        else
+            log ""
+            log "(nothing to apply)"
+        fi
+    else
+        log ""
+        log "Dry-run only. Re-run with --apply to execute safe actions."
+    fi
+fi
+rm -f "$status_file"

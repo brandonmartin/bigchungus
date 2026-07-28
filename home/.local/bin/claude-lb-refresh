@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# claude-lb-refresh — keep ~/.claude-profiles/.lb-cache warm for pool LB.
+#
+# Usage:
+#   claude-lb-refresh refresh     # one-shot refresh (OAuth API, ~1s)
+#   claude-lb-refresh read        # print cached usage A/B + age
+#   claude-lb-refresh daemon      # loop (systemd ExecStart; do not run by hand)
+#   claude-lb-refresh install     # write/enable systemd user unit only
+#
+# On refresh/read/install the systemd user unit is auto-installed when missing.
+#
+# Env:
+#   CLAUDE_LB_REFRESH_INTERVAL      seconds between daemon refreshes (default 30)
+#   CLAUDE_LB_CACHE_TTL             cache freshness window (default 30)
+#   CLAUDE_LB_REFRESH_NO_SYSTEMD=1  skip auto-install (refresh/read still work)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=claude-lb-usage.sh
+source "$SCRIPT_DIR/claude-lb-usage.sh"
+
+INTERVAL="${CLAUDE_LB_REFRESH_INTERVAL:-30}"
+VERBOSE=0
+SYSTEMD_UNIT_NAME="claude-lb-refresh.service"
+
+usage() {
+    cat <<'EOF'
+Usage: claude-lb-refresh <command>
+
+Commands:
+  refresh   Fetch OAuth usage for A+B and update .lb-cache
+  read      Show cached usage, age, and source
+  install   Install/enable the systemd user service (also runs on refresh/read)
+  daemon    Internal: long-running loop (started by systemd)
+  -h        Help
+
+Environment:
+  CLAUDE_LB_REFRESH_INTERVAL      Daemon sleep between refreshes (default 30)
+  CLAUDE_LB_CACHE_TTL             Cache TTL shared with claude-wrapper (default 30)
+  CLAUDE_LB_REFRESH_NO_SYSTEMD=1  Disable automatic systemd user-unit install
+EOF
+}
+
+log() { printf '%s\n' "$*" >&2; }
+vlog() { if (( VERBOSE )); then log "$@"; fi; }
+
+lb_resolve_self() {
+    local self="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f "$self" 2>/dev/null && return 0
+    fi
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$self" 2>/dev/null && return 0
+    fi
+    printf '%s' "$self"
+}
+
+lb_systemd_user_dir() {
+    printf '%s/systemd/user' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+lb_running_under_systemd() {
+    [[ -n "${INVOCATION_ID:-}" ]] && return 0
+    local pcomm
+    pcomm=$(ps -o comm= -p "${PPID:-0}" 2>/dev/null | tr -d '[:space:]')
+    [[ "$pcomm" == "(sd-pam)" || "$pcomm" == "systemd" ]]
+}
+
+lb_render_unit() {
+    local script_path=$1
+    cat <<EOF
+[Unit]
+Description=Claude profile usage cache refresher (OAuth API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${script_path} daemon
+Restart=always
+RestartSec=5s
+Environment=CLAUDE_LB_REFRESH_INTERVAL=${INTERVAL}
+Environment=CLAUDE_LB_CACHE_TTL=${LB_CACHE_TTL}
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+lb_ensure_systemd_service() {
+    if [[ "${CLAUDE_LB_REFRESH_NO_SYSTEMD:-}" == "1" ]]; then
+        vlog "systemd auto-install disabled (CLAUDE_LB_REFRESH_NO_SYSTEMD=1)"
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        vlog "systemctl not found; skipping user-service install"
+        return 0
+    fi
+
+    local script_path unit_dir unit_file desired installed=0
+    script_path=$(lb_resolve_self)
+    unit_dir=$(lb_systemd_user_dir)
+    unit_file="${unit_dir}/${SYSTEMD_UNIT_NAME}"
+    desired=$(lb_render_unit "$script_path")
+
+    mkdir -p "$unit_dir"
+    if [[ -f "$unit_file" ]] && [[ "$(<"$unit_file")" == "$desired" ]]; then
+        vlog "systemd unit up to date: $unit_file"
+    else
+        printf '%s\n' "$desired" >"${unit_file}.tmp.$$"
+        mv -f "${unit_file}.tmp.$$" "$unit_file"
+        installed=1
+        vlog "installed systemd unit: $unit_file"
+    fi
+
+    if (( installed )) || ! systemctl --user cat "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1; then
+        systemctl --user daemon-reload
+    fi
+
+    if systemctl --user is-active --quiet "$SYSTEMD_UNIT_NAME" 2>/dev/null; then
+        vlog "systemd service already active: $SYSTEMD_UNIT_NAME"
+        return 0
+    fi
+
+    if systemctl --user enable --now "$SYSTEMD_UNIT_NAME" 2>/dev/null; then
+        log "started ${SYSTEMD_UNIT_NAME} (usage cache refresh every ${INTERVAL}s)"
+        return 0
+    fi
+
+    log "⚠️  could not enable ${SYSTEMD_UNIT_NAME}; run: systemctl --user enable --now ${SYSTEMD_UNIT_NAME}"
+    return 0
+}
+
+cmd_install() {
+    lb_ensure_systemd_service
+}
+
+cmd_refresh() {
+    local real
+    real=$(lb_find_real_claude)
+    if lb_refresh_usage_cache "$real" 1; then
+        vlog "refreshed via $(lb_read_meta refresh_source 2>/dev/null || echo ?)"
+        return 0
+    fi
+    log "refresh failed"
+    return 1
+}
+
+cmd_read() {
+    local ua ub age src
+    ua=$(lb_read_usage_cache A 2>/dev/null || echo "?")
+    ub=$(lb_read_usage_cache B 2>/dev/null || echo "?")
+    age=$(lb_cache_age 2>/dev/null || echo "?")
+    src=$(lb_read_meta refresh_source 2>/dev/null || echo "?")
+    printf 'usage_A=%s usage_B=%s age_s=%s source=%s ttl=%s\n' "$ua" "$ub" "$age" "$src" "$LB_CACHE_TTL"
+}
+
+cmd_daemon() {
+    if ! lb_running_under_systemd; then
+        lb_ensure_systemd_service
+        log "daemon is managed by ${SYSTEMD_UNIT_NAME}; not running a second loop here"
+        return 0
+    fi
+    log "claude-lb-refresh daemon (interval=${INTERVAL}s ttl=${LB_CACHE_TTL}s)"
+    while true; do
+        cmd_refresh || true
+        sleep "$INTERVAL"
+    done
+}
+
+main() {
+    local cmd=${1:-}
+    case "$cmd" in
+        refresh)
+            shift
+            lb_ensure_systemd_service
+            cmd_refresh "$@"
+            ;;
+        read)
+            shift
+            lb_ensure_systemd_service
+            cmd_read "$@"
+            ;;
+        install) shift; cmd_install "$@" ;;
+        daemon) shift; cmd_daemon "$@" ;;
+        -h|--help|help|"") usage ;;
+        *) log "unknown command: $cmd"; usage; exit 2 ;;
+    esac
+}
+
+main "$@"
