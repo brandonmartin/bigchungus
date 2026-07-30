@@ -17,6 +17,7 @@ activate_ssh_agent
 
 eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 
+
 # >>> grok installer >>>
 export PATH="$HOME/.grok/bin:$PATH"
 fpath=(~/.grok/completions/zsh $fpath)

@@ -17,6 +17,11 @@
 #     ephemeral GC pool workers (dogs, polecats, polekittens). Named
 #     infrastructure (mayor/deacon/witness/refinery) stays hash-pinned
 #     for --resume unless ~/.claude-profiles/agent-overrides says otherwise.
+#
+# 2026-07-30: Absolute ceiling protect — if either profile's raw weekly
+#     usage is >= LB_CEILING (default 99), ALL spawns (LB, hash-pin,
+#     overrides, force-profile, LB-disabled) go to the lighter profile.
+#     Auto-reverts once both profiles are under the ceiling again.
 # ================================================================
 
 set -euo pipefail
@@ -36,6 +41,9 @@ LB_BIAS_THRESHOLD="${CLAUDE_LB_BIAS_THRESHOLD:-2}" # % gap before extra bias
 LB_BIAS_MULTIPLIER="${CLAUDE_LB_BIAS_MULTIPLIER:-5}"
 LB_FORCE_GAP="${CLAUDE_LB_FORCE_GAP:-2}"           # % gap → pool workers go to light profile only
 LB_POOL_PROC_WEIGHT="${CLAUDE_LB_POOL_PROC_WEIGHT:-0}" # pool rebalance follows quota, not proc herd
+# When either profile is at/above this raw weekly usage %, ALL spawns hand out
+# the lighter profile (absolute protect). Drops away once both are under it.
+LB_CEILING="${CLAUDE_LB_CEILING:-99}"
 LB_BASE_DIR="$BASE_DIR"
 LB_CACHE_FILE="$BASE_DIR/.lb-cache"
 LB_LOCK_FILE="$BASE_DIR/.lb-cache.lock"
@@ -117,6 +125,36 @@ hash_profile_for_agent() {
     fi
 }
 
+# If either raw weekly usage is >= LB_CEILING and the other is strictly
+# lighter, set SELECTED_DIR to the light profile and return 0. Else return 1
+# (caller proceeds with normal selection). Applies to every spawn path.
+try_apply_ceiling_protect() {
+    local pool_mode=${1:-0}
+    local label=${2:-spawn}
+    local usage_a usage_b pick
+
+    read -r usage_a usage_b < <(lb_load_usage_snapshot "$REAL_CLAUDE" "$pool_mode") || true
+    usage_a=${usage_a:-0}
+    usage_b=${usage_b:-0}
+
+    if (( usage_a < LB_CEILING && usage_b < LB_CEILING )); then
+        return 1
+    fi
+    if (( usage_a < usage_b )); then
+        pick=A
+    elif (( usage_b < usage_a )); then
+        pick=B
+    else
+        # both at/above ceiling and tied — no unique light profile
+        return 1
+    fi
+
+    SELECTED_DIR="$(profile_dir "$pick")"
+    echo "🔑 [Master Wrapper] ceiling-protect $label → $pick" \
+        "(week A:${usage_a}% B:${usage_b}% | ceiling:${LB_CEILING}% — all spawns to lighter)" >&2
+    return 0
+}
+
 apply_balanced_selection() {
     local label=$1
     local pool_mode=${2:-0}
@@ -170,6 +208,9 @@ count_profile_workers() {
 #   random was leaving ~35% of pool spawns on the heavy account at a 15% gap.
 #   Proc weight is skipped for pool picks so workers already on the light side
 #   do not discourage further pool spawns there.
+# Absolute ceiling: if either raw weekly usage is >= LB_CEILING (default 99),
+#   always hand out the lighter profile (interactive + pool). When both fall
+#   back under the ceiling, normal weighted / force-gap balancing resumes.
 select_profile_balanced() {
     local real=$1
     local pool_mode=${2:-0}
@@ -191,6 +232,24 @@ select_profile_balanced() {
     eff_a=$(( usage_a + corr_a ))
     eff_b=$(( usage_b + corr_b ))
     usage_gap=$(( eff_a - eff_b ))
+
+    # Ceiling protect uses raw weekly % (actual quota), not LB corrections.
+    # Only force when one side is saturated *and* the other is strictly lighter;
+    # if both are at/above ceiling and tied, fall through to normal scoring.
+    if (( usage_a >= LB_CEILING || usage_b >= LB_CEILING )); then
+        if (( usage_a < usage_b )); then
+            pick=A
+            mode=ceiling-protect
+            echo "$pick $usage_a $usage_b $procs_a $procs_b 0 0 $mode"
+            return 0
+        elif (( usage_b < usage_a )); then
+            pick=B
+            mode=ceiling-protect
+            echo "$pick $usage_a $usage_b $procs_a $procs_b 0 0 $mode"
+            return 0
+        fi
+        # both saturated and equal — keep normal path
+    fi
 
     if (( pool_mode )); then
         proc_weight=$LB_POOL_PROC_WEIGHT
@@ -273,7 +332,17 @@ fi
 
 # Profile selection
 GC_KEY="${GC_AGENT:-${GC_SESSION_NAME:-}}"
-if [[ -n "$FORCE_PROFILE" ]]; then
+# Prefer fresher usage when this is an ephemeral pool worker spawn.
+CEILING_POOL_MODE=0
+if [[ -n "$GC_KEY" ]] && is_pool_spawn "$GC_KEY"; then
+    CEILING_POOL_MODE=1
+fi
+
+# Ceiling protect wins over every other selection path (force, override,
+# hash-pin, LB-disabled, weighted). Under the ceiling, normal rules apply.
+if try_apply_ceiling_protect "$CEILING_POOL_MODE" "${GC_KEY:-interactive}"; then
+    :
+elif [[ -n "$FORCE_PROFILE" ]]; then
     SELECTED_DIR="$BASE_DIR/$FORCE_PROFILE"
     echo "🔑 [Master Wrapper] Force → $FORCE_PROFILE" >&2
 elif [[ -n "$GC_KEY" ]]; then

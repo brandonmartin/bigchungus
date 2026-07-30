@@ -56,14 +56,14 @@ install_homebrew_linux() {
 }
 
 install_packages_x() {
-  curl -fSsL https://xpra.org/xpra.asc | sudo tee /etc/apt/keyrings/xpra.asc 1>/dev/null
-  echo "deb [signed-by=/etc/apt/keyrings/xpra.asc] https://xpra.org/ $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/xpra.list
+#  curl -fSsL https://xpra.org/xpra.asc | sudo tee /etc/apt/keyrings/xpra.asc 1>/dev/null
+# echo "deb [signed-by=/etc/apt/keyrings/xpra.asc] https://xpra.org/ $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/xpra.list
   curl -fsSL https://apt.fury.io/wez/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/wezterm-fury.gpg
   echo "deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *" | sudo tee /etc/apt/sources.list.d/wezterm.list
   sudo curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
   echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" | sudo tee /etc/apt/sources.list.d/brave-browser-release.list
   sudo apt update -y
-  sudo sudo apt install xpra i3-wm xserver-xorg-video-fbdev brave-browser picom wezterm-nightly feh -y
+  sudo sudo apt install i3-wm xserver-xorg-video-fbdev brave-browser picom wezterm-nightly feh -y
 }
 
 install_packages() {
