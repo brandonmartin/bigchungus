@@ -9,9 +9,10 @@
 #     versioned binary (comm "2.1.166") made every agent look like a
 #     "zombie process" -> kill/respawn loop (147+ mayor crashes).
 #  2. Deterministic profile selection when running under gascity:
-#     hash GC_AGENT/GC_SESSION_NAME so an agent always lands on the
-#     same profile across respawns -- gc relaunches with --resume and
-#     the session history lives inside CLAUDE_CONFIG_DIR.
+#     hash GC_AGENT/GC_SESSION_NAME (salted with city basename) so an
+#     agent always lands on the same profile across respawns -- gc
+#     relaunches with --resume and the session history lives inside
+#     CLAUDE_CONFIG_DIR.
 #
 # 2026-06-20: Usage-aware load balancing for interactive spawns and
 #     ephemeral GC pool workers (dogs, polecats, polekittens). Named
@@ -22,6 +23,9 @@
 #     usage is >= LB_CEILING (default 99), ALL spawns (LB, hash-pin,
 #     overrides, force-profile, LB-disabled) go to the lighter profile.
 #     Auto-reverts once both profiles are under the ceiling again.
+#
+# 2026-08-02: Hash pin salts with basename(GC_CITY_PATH) (override via
+#     CLAUDE_PROFILE_HASH_SALT) so each city gets its own A/B lottery.
 # ================================================================
 
 set -euo pipefail
@@ -114,16 +118,7 @@ is_pool_spawn() {
     [[ -n "${GC_TEMPLATE:-}" ]] && is_pool_agent "$GC_TEMPLATE"
 }
 
-hash_profile_for_agent() {
-    local agent=$1
-    local hash
-    hash=$(printf '%s' "$agent" | cksum | cut -d' ' -f1)
-    if [ $((hash % 2)) -eq 0 ]; then
-        printf 'A'
-    else
-        printf 'B'
-    fi
-}
+# hash_salt_for_profile / hash_profile_for_agent: claude-lb-usage.sh
 
 # If either raw weekly usage is >= LB_CEILING and the other is strictly
 # lighter, set SELECTED_DIR to the light profile and return 0. Else return 1
@@ -353,8 +348,14 @@ elif [[ -n "$GC_KEY" ]]; then
     elif is_pool_spawn "$GC_KEY"; then
         apply_balanced_selection "GC pool $GC_KEY" 1
     else
-        SELECTED_DIR="$(profile_dir "$(hash_profile_for_agent "$GC_KEY")")"
-        echo "🔑 [Master Wrapper] GC_AGENT=$GC_KEY → $(basename "$SELECTED_DIR")" >&2
+        hash_pick=$(hash_profile_for_agent "$GC_KEY")
+        hash_salt=$(hash_salt_for_profile)
+        SELECTED_DIR="$(profile_dir "$hash_pick")"
+        if [[ -n "$hash_salt" ]]; then
+            echo "🔑 [Master Wrapper] GC_AGENT=$GC_KEY salt=$hash_salt → $hash_pick" >&2
+        else
+            echo "🔑 [Master Wrapper] GC_AGENT=$GC_KEY → $hash_pick" >&2
+        fi
     fi
 elif [[ "${CLAUDE_LB_DISABLE:-}" == "1" ]]; then
     PID=$$

@@ -9,6 +9,8 @@
 # Profile selection matches claude-wrapper.sh:
 #   pool agents → usage-aware LB; infrastructure → hash pin;
 #   ~/.claude-profiles/agent-overrides → manual migrate target.
+# Hash pin salts with basename(city) / CLAUDE_PROFILE_HASH_SALT (see
+# hash_profile_for_agent in claude-lb-usage.sh).
 
 set -euo pipefail
 
@@ -195,11 +197,8 @@ handle_clear_corrections() {
     log ""
 }
 
-hash_profile_for_agent() {
-    local agent=$1 hash
-    hash=$(printf '%s' "$agent" | cksum | cut -d' ' -f1)
-    if [ $((hash % 2)) -eq 0 ]; then printf 'A'; else printf 'B'; fi
-}
+# hash_salt_for_profile / hash_profile_for_agent: claude-lb-usage.sh
+# Salt defaults to basename(CITY) when GC_CITY_PATH is unset (CLI use).
 
 read_agent_override() {
     local agent=$1
@@ -266,7 +265,7 @@ PY
 )
 
     log "🔀 Migrate: $agent"
-    log "   hash default: $hash_prof"
+    log "   hash default: $hash_prof (salt=$(hash_salt_for_profile))"
     [[ -n "$current" ]] && log "   current override: $current"
     log "   target override: $target"
     log "   session state: $state"
@@ -467,10 +466,24 @@ def is_pool_agent(agent: str) -> bool:
         return True
     return False
 
+def hash_salt() -> str:
+    """Match bash hash_salt_for_profile: CLAUDE_PROFILE_HASH_SALT or city basename."""
+    env_salt = os.environ.get("CLAUDE_PROFILE_HASH_SALT", "")
+    if env_salt:
+        return env_salt
+    city = os.environ.get("GC_CITY_PATH") or os.environ.get("CITY", "")
+    if city:
+        return os.path.basename(city.rstrip("/"))
+    return ""
+
 def hash_profile(agent: str) -> str:
     import subprocess
-    h = int(subprocess.check_output(["cksum"], input=agent.encode()).decode().split()[0])
+    salt = hash_salt()
+    material = f"{salt}:{agent}" if salt else agent
+    h = int(subprocess.check_output(["cksum"], input=material.encode()).decode().split()[0])
     return "A" if h % 2 == 0 else "B"
+
+HASH_SALT = hash_salt()
 
 pool_force = os.environ.get("LB_POOL_FORCE", "")
 try:
@@ -671,6 +684,7 @@ for s in sessions:
 
 report = {
     "city": city,
+    "hash_salt": HASH_SALT,
     "usage": {
         "A": usage_a, "B": usage_b,
         "correction": {"A": corr_a, "B": corr_b},
@@ -693,6 +707,10 @@ if os.environ.get("JSON_OUT") == "1":
     sys.exit(0)
 
 print(f"🏙️  gc-balance — {city}")
+if HASH_SALT:
+    print(f"Hash salt: {HASH_SALT} (material = salt:agent; override via CLAUDE_PROFILE_HASH_SALT)")
+else:
+    print("Hash salt: (none — agent-only; set GC_CITY_PATH or CLAUDE_PROFILE_HASH_SALT)")
 if OVERRIDES:
     print("Overrides:", ", ".join(f"{k}→{v}" for k, v in sorted(OVERRIDES.items())))
 if pool_force in ("A", "B"):

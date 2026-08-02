@@ -101,6 +101,44 @@ lb_clear_usage_corrections() {
     rm -f "$LB_USAGE_CORRECTION_FILE"
 }
 
+# Salt for deterministic hash-pin of non-pool agents.
+# Priority: CLAUDE_PROFILE_HASH_SALT (explicit) → basename(GC_CITY_PATH) →
+# basename(CITY) (gc-balance) → empty (legacy agent-only hash).
+hash_salt_for_profile() {
+    if [[ -n "${CLAUDE_PROFILE_HASH_SALT:-}" ]]; then
+        printf '%s' "$CLAUDE_PROFILE_HASH_SALT"
+        return 0
+    fi
+    local city="${GC_CITY_PATH:-${CITY:-}}"
+    if [[ -n "$city" ]]; then
+        city="${city%/}"
+        printf '%s' "${city##*/}"
+        return 0
+    fi
+    printf ''
+}
+
+# Hash-pin profile for named/infrastructure agents. Material is
+#   "${salt}:${agent}" when salt is non-empty, else "${agent}".
+# Salt defaults to basename of GC_CITY_PATH so each city gets its own
+# pin lottery (gasburger.* names no longer inherit gastown pin maps).
+hash_profile_for_agent() {
+    local agent=$1
+    local salt material hash
+    salt=$(hash_salt_for_profile)
+    if [[ -n "$salt" ]]; then
+        material="${salt}:${agent}"
+    else
+        material="$agent"
+    fi
+    hash=$(printf '%s' "$material" | cksum | cut -d' ' -f1)
+    if [ $((hash % 2)) -eq 0 ]; then
+        printf 'A'
+    else
+        printf 'B'
+    fi
+}
+
 lb_profile_dir() {
     case "$1" in
         A) printf '%s' "$LB_BASE_DIR/A" ;;
