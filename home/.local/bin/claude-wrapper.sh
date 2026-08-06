@@ -26,6 +26,13 @@
 #
 # 2026-08-02: Hash pin salts with basename(GC_CITY_PATH) (override via
 #     CLAUDE_PROFILE_HASH_SALT) so each city gets its own A/B lottery.
+#
+# 2026-08-03: Optional board.json selection (gasburger v2 §6.5). When
+#     ~/.claude-profiles/board.json is present and fresh (<10 min),
+#     selection honors seat leases (always — no mid-life swap under
+#     ceiling), reservations, and lightest-eligible by weekly_pct.
+#     Missing/stale → entire legacy path unchanged (fail-safe).
+#     exec -a claude / config seeding untouched.
 # ================================================================
 
 set -euo pipefail
@@ -52,6 +59,12 @@ LB_BASE_DIR="$BASE_DIR"
 LB_CACHE_FILE="$BASE_DIR/.lb-cache"
 LB_LOCK_FILE="$BASE_DIR/.lb-cache.lock"
 AGENT_OVERRIDES_FILE="$BASE_DIR/agent-overrides"
+# Board-materialized account ledger (gasburger v2 §6.5). Written by
+# board-accounts-export.sh. When present and fresh, selection reads this
+# instead of private LB caches. Missing/stale → legacy behavior unchanged.
+BOARD_JSON_FILE="${CLAUDE_BOARD_JSON:-$BASE_DIR/board.json}"
+# Max age of board.json for trust (seconds). Default 10 minutes.
+BOARD_JSON_MAX_AGE="${CLAUDE_BOARD_JSON_MAX_AGE:-600}"
 # ===================================================
 
 _WRAPPER_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -119,6 +132,148 @@ is_pool_spawn() {
 }
 
 # hash_salt_for_profile / hash_profile_for_agent: claude-lb-usage.sh
+
+# ---- Board ledger selection (gasburger §6.5; optional fail-safe) -----------
+# seat_key_matches SEAT KEY: true when board seat id refers to this spawn.
+# Accepts exact match, trailing component match (mayor ↔ gasburger.mayor),
+# and path-ish suffixes (gc-packs/gasburger.witness ↔ gasburger.witness).
+seat_key_matches() {
+    local seat=$1 key=$2
+    [[ -n "$seat" && -n "$key" ]] || return 1
+    [[ "$seat" == "$key" ]] && return 0
+    [[ "$key" == *".$seat" || "$key" == *"/$seat" ]] && return 0
+    [[ "$seat" == *".$key" || "$seat" == *"/$key" ]] && return 0
+    local seat_base key_base
+    seat_base=${seat##*/}
+    seat_base=${seat_base##*.}
+    key_base=${key##*/}
+    key_base=${key_base##*.}
+    [[ -n "$seat_base" && "$seat_base" == "$key_base" ]]
+}
+
+# try_board_selection KEY → sets SELECTED_DIR and returns 0 on hit.
+# KEY is GC_AGENT/GC_SESSION_NAME (may be empty for interactive).
+# Rules (design §6.5 + bead gp-3mc):
+#   1. Named seat with a lease → leased account ALWAYS (even if excluded /
+#      over ceiling). Board schedules account moves at next sleep; the
+#      wrapper must never mid-life swap a named seat. This deliberately
+#      fixes the old ceiling-protect wart that could orphan --resume history.
+#   2. reserved_for holder → that reserved account.
+#   3. Surge/sessionless (no lease) → lightest eligible by weekly_pct among
+#      accounts that are not excluded and not reserved for someone else.
+#   4. board.json missing, unreadable, or older than BOARD_JSON_MAX_AGE →
+#      return 1 so the legacy selection path runs unchanged (fail-safe).
+try_board_selection() {
+    local key=${1:-}
+    local file="$BOARD_JSON_FILE"
+    local max_age="${BOARD_JSON_MAX_AGE:-600}"
+    local now epoch age pick_id pick_dir pick_pct reason
+    local accounts_json row seat
+
+    [[ -f "$file" && -r "$file" ]] || return 1
+
+    # Prefer exported_epoch (unix); fall back to mtime.
+    epoch=$(jq -r '.exported_epoch // empty' "$file" 2>/dev/null || true)
+    if [[ -z "$epoch" || ! "$epoch" =~ ^[0-9]+$ ]]; then
+        epoch=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+    fi
+    now=$(date +%s)
+    age=$(( now - epoch ))
+    if (( age < 0 || age > max_age )); then
+        echo "🔑 [Master Wrapper] board.json stale/future (age=${age}s max=${max_age}s) — legacy selection" >&2
+        return 1
+    fi
+
+    accounts_json=$(jq -c '.accounts // []' "$file" 2>/dev/null || true)
+    [[ -n "$accounts_json" ]] || return 1
+    if [[ "$(jq 'length' <<<"$accounts_json" 2>/dev/null || echo 0)" -eq 0 ]]; then
+        return 1
+    fi
+
+    # --- 1) Lease honor (named seat; never mid-life swap) -----------------
+    if [[ -n "$key" ]]; then
+        while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            while IFS= read -r seat; do
+                [[ -n "$seat" ]] || continue
+                if seat_key_matches "$seat" "$key"; then
+                    pick_id=$(jq -r '.id // empty' <<<"$row")
+                    pick_dir=$(jq -r '.config_dir // empty' <<<"$row")
+                    if [[ -n "$pick_dir" ]]; then
+                        SELECTED_DIR="$pick_dir"
+                        echo "🔑 [Master Wrapper] board lease $key → $pick_id ($pick_dir) [always; no mid-life swap]" >&2
+                        return 0
+                    fi
+                fi
+            done < <(jq -r '.leases // [] | .[]' <<<"$row" 2>/dev/null || true)
+        done < <(jq -c '.[]' <<<"$accounts_json" 2>/dev/null || true)
+
+        # --- 2) Reservation holder -----------------------------------------
+        while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            while IFS= read -r seat; do
+                [[ -n "$seat" ]] || continue
+                if seat_key_matches "$seat" "$key"; then
+                    pick_id=$(jq -r '.id // empty' <<<"$row")
+                    pick_dir=$(jq -r '.config_dir // empty' <<<"$row")
+                    if [[ -n "$pick_dir" ]]; then
+                        SELECTED_DIR="$pick_dir"
+                        echo "🔑 [Master Wrapper] board reserved $key → $pick_id ($pick_dir)" >&2
+                        return 0
+                    fi
+                fi
+            done < <(jq -r '.reserved_for // [] | .[]' <<<"$row" 2>/dev/null || true)
+        done < <(jq -c '.[]' <<<"$accounts_json" 2>/dev/null || true)
+    fi
+
+    # --- 3) Lightest eligible (surge / sessionless / no lease) ------------
+    # Exclude: excluded==true, or reserved_for non-empty (reserved accounts
+    # are off-limits to everyone except their holder — handled above).
+    pick_id=""
+    pick_dir=""
+    pick_pct=""
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        if [[ "$(jq -r '.excluded == true' <<<"$row")" == "true" ]]; then
+            continue
+        fi
+        if [[ "$(jq -r '(.reserved_for // []) | length' <<<"$row")" -gt 0 ]]; then
+            continue
+        fi
+        local_id=$(jq -r '.id // empty' <<<"$row")
+        local_dir=$(jq -r '.config_dir // empty' <<<"$row")
+        local_pct=$(jq -r '(.weekly_pct // 0) | tonumber' <<<"$row")
+        [[ -n "$local_dir" ]] || continue
+        if [[ -z "$pick_dir" ]]; then
+            pick_id=$local_id
+            pick_dir=$local_dir
+            pick_pct=$local_pct
+        else
+            # Numeric compare via awk (avoid jq bool in bash arithmetic).
+            cmp=$(awk -v a="$local_pct" -v b="$pick_pct" 'BEGIN {
+              if (a+0 < b+0) print "lt";
+              else if (a+0 == b+0) print "eq";
+              else print "gt";
+            }')
+            if [[ "$cmp" == "lt" ]] || { [[ "$cmp" == "eq" ]] && [[ "$local_id" < "$pick_id" ]]; }; then
+                pick_id=$local_id
+                pick_dir=$local_dir
+                pick_pct=$local_pct
+            fi
+        fi
+    done < <(jq -c '.[]' <<<"$accounts_json" 2>/dev/null || true)
+
+    if [[ -n "$pick_dir" ]]; then
+        SELECTED_DIR="$pick_dir"
+        reason="board-lightest"
+        [[ -n "$key" ]] && reason="board-lightest $key"
+        echo "🔑 [Master Wrapper] $reason → $pick_id ($pick_dir) week:${pick_pct}%" >&2
+        return 0
+    fi
+
+    # No eligible account from board — fail-safe to legacy path.
+    return 1
+}
 
 # If either raw weekly usage is >= LB_CEILING and the other is strictly
 # lighter, set SELECTED_DIR to the light profile and return 0. Else return 1
@@ -333,9 +488,14 @@ if [[ -n "$GC_KEY" ]] && is_pool_spawn "$GC_KEY"; then
     CEILING_POOL_MODE=1
 fi
 
-# Ceiling protect wins over every other selection path (force, override,
-# hash-pin, LB-disabled, weighted). Under the ceiling, normal rules apply.
-if try_apply_ceiling_protect "$CEILING_POOL_MODE" "${GC_KEY:-interactive}"; then
+# Board ledger (when board.json is present + fresh) is the single source of
+# truth for selection (§6.5). It honors seat leases even under ceiling
+# (no mid-life swap). Missing/stale board → legacy path unchanged.
+# Ceiling protect is legacy-only; the board's ceiling-guard + excluded flag
+# absorb that role for board-aware picks.
+if try_board_selection "$GC_KEY"; then
+    :
+elif try_apply_ceiling_protect "$CEILING_POOL_MODE" "${GC_KEY:-interactive}"; then
     :
 elif [[ -n "$FORCE_PROFILE" ]]; then
     SELECTED_DIR="$BASE_DIR/$FORCE_PROFILE"
