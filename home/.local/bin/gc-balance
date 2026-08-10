@@ -7,8 +7,9 @@
 # unless --allow-infrastructure is set.
 #
 # Profile selection matches claude-wrapper.sh:
-#   pool agents → usage-aware LB; infrastructure → hash pin;
-#   ~/.claude-profiles/agent-overrides → manual migrate target.
+#   ~/.claude-profiles/agent-overrides → manual migrate target;
+#   ~/.claude-profiles/board.json (fresh) → seat leases (gasburger v2 §6.5);
+#   pool agents → usage-aware LB; infrastructure → hash pin.
 # Hash pin salts with basename(city) / CLAUDE_PROFILE_HASH_SALT (see
 # hash_profile_for_agent in claude-lb-usage.sh).
 
@@ -446,6 +447,42 @@ def load_overrides() -> dict:
 
 OVERRIDES = load_overrides()
 
+def load_leases() -> dict:
+    """Board-driven seat→profile lease map, matching claude-wrapper.sh §6.5.
+
+    Reads ~/.claude-profiles/board.json (override: CLAUDE_BOARD_JSON) when it
+    exists and is fresher than CLAUDE_BOARD_JSON_MAX_AGE seconds (default 600,
+    same as the wrapper). Returns {} on any read/parse failure or staleness so
+    the caller falls back cleanly to hash/LB — mirrors the wrapper's fail-safe.
+    """
+    path = os.environ.get("CLAUDE_BOARD_JSON") or os.path.join(
+        os.path.expanduser("~"), ".claude-profiles", "board.json")
+    try:
+        max_age = int(os.environ.get("CLAUDE_BOARD_JSON_MAX_AGE", "600"))
+    except ValueError:
+        max_age = 600
+    try:
+        st = os.stat(path)
+        exported = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+        age = (datetime.now(tz=timezone.utc) - exported).total_seconds()
+        if age < 0 or age > max_age:
+            return {}
+        with open(path, "r") as f:
+            data = json.load(f)
+        out = {}
+        for row in data.get("accounts", []):
+            aid = str(row.get("id", "")).upper()
+            if aid not in ("A", "B"):
+                continue
+            for seat in row.get("leases", []) or []:
+                if seat:
+                    out[seat] = aid
+        return out
+    except (OSError, ValueError, KeyError):
+        return {}
+
+LEASES = load_leases()
+
 def is_pool_agent(agent: str) -> bool:
     if not agent:
         return False
@@ -495,6 +532,8 @@ except ValueError:
 def profile_selection(agent: str) -> tuple[str, str]:
     if agent in OVERRIDES:
         return OVERRIDES[agent], "override"
+    if agent in LEASES:
+        return LEASES[agent], "lease"
     if is_pool_agent(agent):
         if pool_force in ("A", "B"):
             return pool_force, "pool-force"
