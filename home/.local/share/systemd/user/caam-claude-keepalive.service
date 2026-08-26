@@ -1,0 +1,18 @@
+[Unit]
+Description=Refresh idle CAAM Claude vault tokens (isolated ping)
+Documentation=file:///home/b/caam-credential-rotation.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+TimeoutStartSec=10min
+Environment=PATH=%h/.grok/bin:%h/.local/bin:%h/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.local/share/systemd/user/caam-claude-keepalive.env
+ExecStart=%h/.local/bin/caam-claude-keepalive
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

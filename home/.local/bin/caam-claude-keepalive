@@ -1,0 +1,490 @@
+#!/usr/bin/env bash
+# Keep CAAM Claude vault snapshots from going stale.
+#
+# Claude Code is the only thing that can rotate Claude OAuth tokens. CAAM's
+# daemon cannot. This script:
+#
+#   1. Copies the currently-live ~/.claude login back into its vault slot
+#      (`caam backup`). No account switch. Safe while other Claudes are running.
+#
+#   2. For every other (idle) vault profile, starts a throwaway Claude in a
+#      private HOME, lets it refresh that grant, then copies the new
+#      .credentials.json into the vault. Live ~/.claude is never swapped.
+#
+# MODE=flop does the activate → ping → activate-back dance instead. It will
+# refuse to run if any Claude process is using your real HOME — otherwise it
+# would change the account under Gas Town / other live sessions.
+#
+# Env (all optional). Defaults also live in:
+#   ~/.local/share/systemd/user/caam-claude-keepalive.env
+#   CAAM_KEEPALIVE_MODE          isolated (default) | flop
+#   CAAM_KEEPALIVE_TOOL          claude
+#   CAAM_KEEPALIVE_MODEL         claude-haiku-4-5-20251001
+#   CAAM_KEEPALIVE_REFRESH_TTL   2h    — ping idle profile when vault access token
+#                                        has this much (or less) remaining, or is expired
+#   CAAM_KEEPALIVE_PING_EVERY    25m   — min gap between pings of the same idle profile
+#   CAAM_KEEPALIVE_TIMEOUT       180   — seconds for the claude ping
+#   CAAM_KEEPALIVE_DRY_RUN       1     — log only
+#
+# Usage:
+#   caam-claude-keepalive
+#   CAAM_KEEPALIVE_DRY_RUN=1 caam-claude-keepalive
+#   CAAM_KEEPALIVE_MODE=flop caam-claude-keepalive
+
+set -euo pipefail
+
+# Repo-tracked defaults. Already-set environment (CLI / systemd) wins.
+ENV_FILE="${CAAM_KEEPALIVE_ENV:-${XDG_DATA_HOME:-$HOME/.local/share}/systemd/user/caam-claude-keepalive.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  while IFS='=' read -r key value || [[ -n "${key:-}" ]]; do
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ -z "${!key+isset}" ]]; then
+      export "$key=$value"
+    fi
+  done < <(sed -e 's/[[:space:]]*#.*//' -e '/^[[:space:]]*$/d' "$ENV_FILE")
+fi
+
+TOOL="${CAAM_KEEPALIVE_TOOL:-claude}"
+MODE="${CAAM_KEEPALIVE_MODE:-isolated}"
+MODEL="${CAAM_KEEPALIVE_MODEL:-claude-haiku-4-5-20251001}"
+REFRESH_TTL="${CAAM_KEEPALIVE_REFRESH_TTL:-2h}"
+PING_EVERY="${CAAM_KEEPALIVE_PING_EVERY:-25m}"
+PING_TIMEOUT="${CAAM_KEEPALIVE_TIMEOUT:-180}"
+DRY="${CAAM_KEEPALIVE_DRY_RUN:-0}"
+
+REAL_HOME="${CAAM_KEEPALIVE_REAL_HOME:-$HOME}"
+# Pin these *before* any isolated ping rewrites HOME/XDG.
+REAL_HOME="$(cd "$REAL_HOME" && pwd -P)"
+export HOME="$REAL_HOME"
+
+CAAM_BIN="${CAAM_BIN:-$(command -v caam)}"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude)}"
+DATA_DIR="${CAAM_KEEPALIVE_DATA:-$REAL_HOME/.local/share/caam}"
+VAULT_DIR="$DATA_DIR/vault/$TOOL"
+KEEP_ROOT="$DATA_DIR/keepalive"
+LOG_FILE="${CAAM_KEEPALIVE_LOG:-$DATA_DIR/keepalive.log}"
+LOCK_FILE="$KEEP_ROOT/keepalive.lock"
+STATE_DIR="$KEEP_ROOT/state"
+
+mkdir -p "$KEEP_ROOT" "$STATE_DIR" "$(dirname "$LOG_FILE")"
+
+log() {
+  local ts
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  printf '%s %s\n' "$ts" "$*" | tee -a "$LOG_FILE"
+}
+
+die() { log "ERROR: $*"; exit 1; }
+
+is_dry() { [[ "$DRY" == "1" || "$DRY" == "true" || "$DRY" == "yes" ]]; }
+
+run() {
+  if is_dry; then
+    log "DRY: $*"
+    return 0
+  fi
+  "$@"
+}
+
+parse_duration_s() {
+  # 12h | 6h | 30m | 90 | 90s
+  local raw="${1,,}"
+  local n="${raw%%[a-z]*}"
+  local u="${raw#"$n"}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { echo 0; return; }
+  case "$u" in
+    ""|s) echo "$n" ;;
+    m)    echo $((n * 60)) ;;
+    h)    echo $((n * 3600)) ;;
+    d)    echo $((n * 86400)) ;;
+    *)    echo 0 ;;
+  esac
+}
+
+oauth_expires_epoch() {
+  # prints unix seconds of claudeAiOauth.expiresAt, or 0
+  local f="$1"
+  python3 - "$f" <<'PY'
+import json, sys, os
+path = sys.argv[1]
+try:
+    data = json.loads(open(path).read())
+    oauth = data.get("claudeAiOauth") or {}
+    exp = oauth.get("expiresAt") or 0
+    exp = int(exp)
+    if exp > 10_000_000_000:
+        exp //= 1000
+    print(exp)
+except Exception:
+    print(0)
+PY
+}
+
+oauth_tokens_ok() {
+  local f="$1"
+  python3 - "$f" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    oauth = json.loads(open(path).read()).get("claudeAiOauth") or {}
+    at = (oauth.get("accessToken") or "").strip()
+    rt = (oauth.get("refreshToken") or "").strip()
+    raise SystemExit(0 if at and rt else 1)
+except SystemExit as e:
+    raise
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+live_email() {
+  python3 - "$REAL_HOME/.claude.json" <<'PY'
+import json, sys
+try:
+    print(json.loads(open(sys.argv[1]).read()).get("oauthAccount", {}).get("emailAddress") or "")
+except Exception:
+    print("")
+PY
+}
+
+active_profile() {
+  "$CAAM_BIN" status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+for t in d.get("tools") or []:
+    if t.get("tool") == "'"$TOOL"'":
+        print(t.get("active_profile") or "")
+        break
+'
+}
+
+list_user_profiles() {
+  "$CAAM_BIN" ls "$TOOL" --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for p in d.get("profiles") or []:
+    name = p.get("name") or ""
+    if p.get("system"):
+        continue
+    if name.startswith("_"):
+        continue
+    print(name)
+'
+}
+
+claude_using_real_home() {
+  # Count Claude-ish processes whose HOME is the real user home.
+  python3 - "$REAL_HOME" <<'PY'
+import os, sys
+real = sys.argv[1]
+n = 0
+proc = "/proc"
+for pid in os.listdir(proc):
+    if not pid.isdigit():
+        continue
+    base = os.path.join(proc, pid)
+    try:
+        comm = open(os.path.join(base, "comm")).read().strip()
+        cmdline = open(os.path.join(base, "cmdline"), "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+        env = open(os.path.join(base, "environ"), "rb").read().split(b"\0")
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        continue
+    home = ""
+    for e in env:
+        if e.startswith(b"HOME="):
+            home = e[5:].decode("utf-8", "replace")
+            break
+    if home != real:
+        continue
+    claudeish = comm == "claude" or "/claude" in cmdline.split(" ")[0] or " claude " in f" {cmdline} "
+    if not claudeish:
+        continue
+    n += 1
+print(n)
+PY
+}
+
+last_ok_file() {
+  local profile="$1"
+  # @ is legal in filenames; keep it simple
+  echo "$STATE_DIR/${profile}.last_ok"
+}
+
+recently_pinged() {
+  local profile="$1"
+  local every_s
+  every_s="$(parse_duration_s "$PING_EVERY")"
+  [[ "$every_s" -gt 0 ]] || return 1
+  local f
+  f="$(last_ok_file "$profile")"
+  [[ -f "$f" ]] || return 1
+  local now mtime
+  now="$(date +%s)"
+  mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+  (( now - mtime < every_s ))
+}
+
+profile_ttl_s() {
+  local cred="$VAULT_DIR/$1/.credentials.json"
+  local exp now
+  now="$(date +%s)"
+  exp="$(oauth_expires_epoch "$cred")"
+  echo $((exp - now))
+}
+
+fmt_ttl() {
+  local s="$1"
+  local sign=""
+  if (( s < 0 )); then
+    sign="-"
+    s=$((-s))
+  fi
+  printf '%s%dm' "$sign" $((s / 60))
+}
+
+# Return 0 if this idle profile should be pinged now.
+should_ping_idle() {
+  local profile="$1"
+  local ttl thresh
+  ttl="$(profile_ttl_s "$profile")"
+  thresh="$(parse_duration_s "$REFRESH_TTL")"
+  (( thresh > 0 )) || thresh=7200
+
+  if (( ttl > thresh )); then
+    log "skip ping $profile (vault has $(fmt_ttl "$ttl") left, threshold $REFRESH_TTL)"
+    return 1
+  fi
+  if recently_pinged "$profile"; then
+    log "skip ping $profile (ttl $(fmt_ttl "$ttl") but last ping within $PING_EVERY)"
+    return 1
+  fi
+  log "ping $profile (vault ttl $(fmt_ttl "$ttl") <= $REFRESH_TTL)"
+  return 0
+}
+
+mark_ok() {
+  local profile="$1"
+  is_dry && return 0
+  date -u +'%Y-%m-%dT%H:%M:%SZ' > "$(last_ok_file "$profile")"
+}
+
+atomic_cp() {
+  local src="$1" dst="$2"
+  local tmp
+  tmp="${dst}.tmp.$$"
+  cp -f -- "$src" "$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$dst"
+}
+
+seed_keepalive_home() {
+  local profile="$1" kh="$2"
+  local vault="$VAULT_DIR/$profile"
+  mkdir -p "$kh/.claude" "$kh/.config" "$kh/.local/share" "$kh/.local/state" "$kh/.cache" "$kh/.keepalive-cwd"
+  if [[ -f "$vault/.claude.json" && ! -f "$kh/.claude.json" ]]; then
+    atomic_cp "$vault/.claude.json" "$kh/.claude.json"
+  fi
+  if [[ -f "$vault/settings.json" && ! -f "$kh/.claude/settings.json" ]]; then
+    atomic_cp "$vault/settings.json" "$kh/.claude/settings.json"
+  fi
+  local khc="$kh/.claude/.credentials.json"
+  local vc="$vault/.credentials.json"
+  [[ -f "$vc" ]] || return 0
+  if [[ -f "$khc" ]]; then
+    local kh_exp vault_exp
+    kh_exp="$(oauth_expires_epoch "$khc")"
+    vault_exp="$(oauth_expires_epoch "$vc")"
+    if (( kh_exp > 0 && kh_exp >= vault_exp )) && oauth_tokens_ok "$khc"; then
+      return 0
+    fi
+  fi
+  atomic_cp "$vc" "$khc"
+}
+
+ping_claude() {
+  local kh="$1"
+  local cwd="${2:-$kh/.keepalive-cwd}"
+  mkdir -p "$cwd"
+  local extra=()
+  extra+=(-p "Reply with the single word pong and nothing else.")
+  extra+=(--output-format text)
+  extra+=(--model "$MODEL")
+  extra+=(--effort low)
+  extra+=(--permission-mode dontAsk)
+  (
+    export HOME="$kh"
+    export XDG_CONFIG_HOME="$kh/.config"
+    export XDG_DATA_HOME="$kh/.local/share"
+    export XDG_STATE_HOME="$kh/.local/state"
+    export XDG_CACHE_HOME="$kh/.cache"
+    unset CLAUDE_CONFIG_DIR || true
+    unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN || true
+    export CLAUDE_CODE_DISABLE_AGENT_VIEW=1
+    cd "$cwd"
+    timeout --signal=TERM --kill-after=20s "$PING_TIMEOUT" \
+      "$CLAUDE_BIN" "${extra[@]}"
+  )
+}
+
+copy_keepalive_to_vault() {
+  local profile="$1" kh="$2"
+  local src="$kh/.claude/.credentials.json"
+  local dst="$VAULT_DIR/$profile/.credentials.json"
+  [[ -f "$src" ]] || return 1
+  oauth_tokens_ok "$src" || return 1
+  local src_exp dst_exp
+  src_exp="$(oauth_expires_epoch "$src")"
+  dst_exp=0
+  [[ -f "$dst" ]] && dst_exp="$(oauth_expires_epoch "$dst")"
+  if (( src_exp <= dst_exp )); then
+    # Ping succeeded but Claude did not rotate (access token still valid).
+    # Same generation as the vault is success, not a failed copy.
+    log "  $profile: vault already current (expiry $dst_exp); nothing to copy"
+    return 0
+  fi
+  run atomic_cp "$src" "$dst"
+  log "  $profile: vault credentials updated (expires epoch $src_exp)"
+}
+
+resnapshot_active() {
+  local profile="$1"
+  [[ -n "$profile" ]] || { log "no active $TOOL profile to resnapshot"; return 0; }
+  log "resnapshot live → vault $TOOL/$profile"
+  if is_dry; then
+    log "DRY: $CAAM_BIN backup $TOOL $profile --json"
+    return 0
+  fi
+  if ! "$CAAM_BIN" backup "$TOOL" "$profile" --json; then
+    log "WARNING: caam backup $TOOL $profile failed"
+    return 1
+  fi
+}
+
+ping_isolated() {
+  local profile="$1"
+  local kh="$KEEP_ROOT/homes/$profile"
+  log "isolated ping $TOOL/$profile (HOME=$kh)"
+  if is_dry; then
+    log "DRY: seed $kh from vault, claude -p pong, copy creds back"
+    return 0
+  fi
+  seed_keepalive_home "$profile" "$kh"
+  if ! ping_claude "$kh"; then
+    log "WARNING: ping failed for $profile"
+    return 1
+  fi
+  copy_keepalive_to_vault "$profile" "$kh"
+}
+
+ping_flop() {
+  local profile="$1" original="$2"
+  log "flop ping $TOOL/$profile (will restore $original)"
+  local live_n
+  live_n="$(claude_using_real_home)"
+  if (( live_n > 0 )); then
+    log "REFUSING flop: $live_n Claude process(es) using HOME=$REAL_HOME"
+    log "  Switching ~/.claude under them would change their account. Use MODE=isolated."
+    return 1
+  fi
+  if is_dry; then
+    log "DRY: caam activate $TOOL $profile && claude -p pong && caam activate $TOOL $original"
+    return 0
+  fi
+  local restored=0
+  restore() {
+    (( restored )) && return 0
+    restored=1
+    log "flop restore → $original"
+    "$CAAM_BIN" activate "$TOOL" "$original" --json --force || \
+      log "WARNING: failed to restore $original — live login may still be $profile"
+  }
+  trap restore EXIT
+  if ! "$CAAM_BIN" activate "$TOOL" "$profile" --json --force; then
+    log "WARNING: activate $profile failed"
+    trap - EXIT
+    return 1
+  fi
+  # Ping in the real HOME (that's the point of flop). Keep cwd off ~.
+  if ! ping_claude "$REAL_HOME" "$KEEP_ROOT/flop-cwd"; then
+    log "WARNING: flop ping failed for $profile"
+    restore
+    trap - EXIT
+    return 1
+  fi
+  restore
+  trap - EXIT
+  # activate-back resnapshots outgoing ($profile) via ResnapshotOutgoing.
+  return 0
+}
+
+# --- main ---
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  log "another keepalive is running; exiting"
+  exit 0
+fi
+
+[[ -x "$CAAM_BIN" ]] || die "caam not found (CAAM_BIN=$CAAM_BIN)"
+[[ -x "$CLAUDE_BIN" ]] || die "claude not found (CLAUDE_BIN=$CLAUDE_BIN)"
+[[ -d "$VAULT_DIR" ]] || die "vault dir missing: $VAULT_DIR"
+
+log "start mode=$MODE tool=$TOOL model=$MODEL refresh_ttl=$REFRESH_TTL ping_every=$PING_EVERY dry=$DRY"
+
+active="$(active_profile || true)"
+email="$(live_email || true)"
+log "live active_profile=${active:-?} live_email=${email:-?}"
+
+if [[ -n "$active" ]]; then
+  resnapshot_active "$active" || true
+elif [[ -n "$email" ]]; then
+  resnapshot_active "$email" || true
+  active="$email"
+fi
+
+mapfile -t profiles < <(list_user_profiles)
+if (( ${#profiles[@]} == 0 )); then
+  log "no user profiles in vault; done"
+  exit 0
+fi
+
+fail=0
+for profile in "${profiles[@]}"; do
+  if [[ -n "$active" && "$profile" == "$active" ]]; then
+    log "skip ping $profile (it is the live account; resnapshot already ran)"
+    continue
+  fi
+  if ! should_ping_idle "$profile"; then
+    continue
+  fi
+  case "$MODE" in
+    isolated)
+      if ping_isolated "$profile"; then
+        mark_ok "$profile"
+      else
+        fail=1
+      fi
+      ;;
+    flop)
+      if [[ -z "$active" ]]; then
+        log "ERROR: flop needs a known live profile to restore"
+        fail=1
+        continue
+      fi
+      if ping_flop "$profile" "$active"; then
+        mark_ok "$profile"
+      else
+        fail=1
+      fi
+      ;;
+    *)
+      die "unknown CAAM_KEEPALIVE_MODE=$MODE (use isolated or flop)"
+      ;;
+  esac
+done
+
+log "done"
+exit "$fail"

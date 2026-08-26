@@ -1,0 +1,15 @@
+[Unit]
+Description=Keep CAAM Claude vault tokens fresh (30m)
+Documentation=file:///home/b/caam-credential-rotation.md
+
+[Timer]
+# First run shortly after login/boot, then 30m after the last *start*.
+# Access tokens last ~8h; idle profiles are pinged when TTL <= 2h.
+OnBootSec=1min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=caam-claude-keepalive.service
+
+[Install]
+WantedBy=timers.target
