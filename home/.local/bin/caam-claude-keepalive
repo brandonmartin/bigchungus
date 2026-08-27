@@ -227,12 +227,16 @@ recently_pinged() {
   (( now - mtime < every_s ))
 }
 
-profile_ttl_s() {
-  local cred="$VAULT_DIR/$1/.credentials.json"
+cred_ttl_s() {
+  local cred="$1"
   local exp now
   now="$(date +%s)"
   exp="$(oauth_expires_epoch "$cred")"
   echo $((exp - now))
+}
+
+profile_ttl_s() {
+  cred_ttl_s "$VAULT_DIR/$1/.credentials.json"
 }
 
 fmt_ttl() {
@@ -245,24 +249,51 @@ fmt_ttl() {
   printf '%s%dm' "$sign" $((s / 60))
 }
 
-# Return 0 if this idle profile should be pinged now.
-should_ping_idle() {
-  local profile="$1"
+fmt_exp() {
+  local epoch="$1"
+  if (( epoch <= 0 )); then
+    printf 'unknown'
+    return
+  fi
+  date -u -d "@$epoch" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '%s' "$epoch"
+}
+
+log_cred() {
+  local label="$1" path="$2"
+  if [[ ! -f "$path" ]]; then
+    log "  $label: missing $path"
+    return
+  fi
+  local exp ttl
+  exp="$(oauth_expires_epoch "$path")"
+  ttl="$(cred_ttl_s "$path")"
+  log "  $label: expires $(fmt_exp "$exp") ttl $(fmt_ttl "$ttl")"
+}
+
+# Return 0 if this credential file is inside the refresh window.
+should_ping_cred() {
+  local profile="$1" cred="$2" source="$3"
   local ttl thresh
-  ttl="$(profile_ttl_s "$profile")"
+  ttl="$(cred_ttl_s "$cred")"
   thresh="$(parse_duration_s "$REFRESH_TTL")"
   (( thresh > 0 )) || thresh=7200
 
   if (( ttl > thresh )); then
-    log "skip ping $profile (vault has $(fmt_ttl "$ttl") left, threshold $REFRESH_TTL)"
+    log "skip ping $profile ($source has $(fmt_ttl "$ttl") left, threshold $REFRESH_TTL)"
     return 1
   fi
-  if recently_pinged "$profile"; then
-    log "skip ping $profile (ttl $(fmt_ttl "$ttl") but last ping within $PING_EVERY)"
+  # A ping of a still-valid token often does not rotate. If it is already
+  # expired, do not let the min-gap skip hide a red `caam ls` row.
+  if (( ttl > 0 )) && recently_pinged "$profile"; then
+    log "skip ping $profile ($source ttl $(fmt_ttl "$ttl") but last ping within $PING_EVERY)"
     return 1
   fi
-  log "ping $profile (vault ttl $(fmt_ttl "$ttl") <= $REFRESH_TTL)"
+  log "need ping $profile ($source ttl $(fmt_ttl "$ttl") <= $REFRESH_TTL, expires $(fmt_exp "$(oauth_expires_epoch "$cred")"))"
   return 0
+}
+
+should_ping_idle() {
+  should_ping_cred "$1" "$VAULT_DIR/$1/.credentials.json" "vault"
 }
 
 mark_ok() {
@@ -339,14 +370,45 @@ copy_keepalive_to_vault() {
   src_exp="$(oauth_expires_epoch "$src")"
   dst_exp=0
   [[ -f "$dst" ]] && dst_exp="$(oauth_expires_epoch "$dst")"
+  local now ttl
+  now="$(date +%s)"
+  ttl=$((src_exp - now))
   if (( src_exp <= dst_exp )); then
-    # Ping succeeded but Claude did not rotate (access token still valid).
-    # Same generation as the vault is success, not a failed copy.
-    log "  $profile: vault already current (expiry $dst_exp); nothing to copy"
+    # Ping succeeded but Claude did not rotate the file (still the same generation).
+    if (( ttl <= 0 )); then
+      log "  $profile: ping did not rotate; vault still EXPIRED ($(fmt_exp "$dst_exp"))"
+    else
+      log "  $profile: ping did not rotate; vault still $(fmt_exp "$dst_exp") ($(fmt_ttl "$ttl") left)"
+    fi
     return 0
   fi
   run atomic_cp "$src" "$dst"
-  log "  $profile: vault credentials updated (expires epoch $src_exp)"
+  log "  $profile: vault credentials updated → $(fmt_exp "$src_exp") ($(fmt_ttl "$ttl") left)"
+}
+
+# Rotate the LIVE ~/.claude login in place, then caller resnapshots to vault.
+# Must not use an isolated HOME: that would consume the refresh token in a
+# copy and leave running Claudes on a revoked generation.
+ping_live() {
+  local profile="$1"
+  local before after
+  before="$(oauth_expires_epoch "$REAL_HOME/.claude/.credentials.json")"
+  log "live ping $TOOL/$profile (HOME=$REAL_HOME, in-place rotate)"
+  if is_dry; then
+    log "DRY: claude -p pong with real HOME, then caam backup"
+    return 0
+  fi
+  if ! ping_claude "$REAL_HOME" "$KEEP_ROOT/live-cwd"; then
+    log "WARNING: live ping failed for $profile"
+    return 1
+  fi
+  sleep 2
+  after="$(oauth_expires_epoch "$REAL_HOME/.claude/.credentials.json")"
+  if (( after > before )); then
+    log "  live rotated $(fmt_exp "$before") → $(fmt_exp "$after") ($(fmt_ttl $((after - $(date +%s)))) left)"
+  else
+    log "  live ping did not rotate file (still $(fmt_exp "$after"), ttl $(fmt_ttl "$(cred_ttl_s "$REAL_HOME/.claude/.credentials.json")"))"
+  fi
 }
 
 resnapshot_active() {
@@ -376,6 +438,7 @@ ping_isolated() {
     log "WARNING: ping failed for $profile"
     return 1
   fi
+  sleep 2
   copy_keepalive_to_vault "$profile" "$kh"
 }
 
@@ -437,13 +500,7 @@ log "start mode=$MODE tool=$TOOL model=$MODEL refresh_ttl=$REFRESH_TTL ping_ever
 active="$(active_profile || true)"
 email="$(live_email || true)"
 log "live active_profile=${active:-?} live_email=${email:-?}"
-
-if [[ -n "$active" ]]; then
-  resnapshot_active "$active" || true
-elif [[ -n "$email" ]]; then
-  resnapshot_active "$email" || true
-  active="$email"
-fi
+log_cred "live $REAL_HOME/.claude/.credentials.json" "$REAL_HOME/.claude/.credentials.json"
 
 mapfile -t profiles < <(list_user_profiles)
 if (( ${#profiles[@]} == 0 )); then
@@ -451,10 +508,31 @@ if (( ${#profiles[@]} == 0 )); then
   exit 0
 fi
 
+for profile in "${profiles[@]}"; do
+  log_cred "vault $profile" "$VAULT_DIR/$profile/.credentials.json"
+done
+
 fail=0
+
+if [[ -z "$active" && -n "$email" ]]; then
+  active="$email"
+fi
+
+if [[ -n "$active" ]]; then
+  live_creds="$REAL_HOME/.claude/.credentials.json"
+  if should_ping_cred "$active" "$live_creds" "live"; then
+    if ping_live "$active"; then
+      mark_ok "$active"
+    else
+      fail=1
+    fi
+  fi
+  resnapshot_active "$active" || true
+  log_cred "vault $active after backup" "$VAULT_DIR/$active/.credentials.json"
+fi
+
 for profile in "${profiles[@]}"; do
   if [[ -n "$active" && "$profile" == "$active" ]]; then
-    log "skip ping $profile (it is the live account; resnapshot already ran)"
     continue
   fi
   if ! should_ping_idle "$profile"; then
