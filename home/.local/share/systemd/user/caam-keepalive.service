@@ -1,0 +1,18 @@
+[Unit]
+Description=caam keepalive: renew idle claude/grok logins in place
+Documentation=https://github.com/Dicklesworthstone/coding_agent_account_manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+TimeoutStartSec=15min
+# The provider CLIs (claude, grok) must be on PATH.
+Environment=PATH=%h/.local/bin:%h/.grok/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/caam keepalive
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Run caam keepalive every 30 minutes
+
+[Timer]
+# Wall-clock anchor: re-arms after a user-manager restart, and Persistent
+# catches up a run missed while the machine was off. Do not use
+# OnBootSec/OnUnitActiveSec alone; they can leave the timer with no next run.
+OnCalendar=*:0/30
+Persistent=true
+AccuracySec=1min
+Unit=caam-keepalive.service
+
+[Install]
+WantedBy=timers.target
