@@ -23,3 +23,8 @@ export PATH="$HOME/.grok/bin:$PATH"
 fpath=(~/.grok/completions/zsh $fpath)
 autoload -Uz compinit && compinit -C
 # <<< grok installer <<<
+export BD_IGNORE_SCHEMA_SKEW=1
+
+# >>> Codex installer >>>
+export PATH="/home/b/orch-homes/A/.local/bin:$PATH"
+# <<< Codex installer <<<
